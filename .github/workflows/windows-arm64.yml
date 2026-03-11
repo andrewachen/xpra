@@ -1,0 +1,59 @@
+name: Windows ARM64
+
+on:
+  push:
+    branches:
+      - windows-arm64-ci
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Windows ARM64 installer
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Configure git safe directory
+        shell: cmd
+        run: git config --global --add safe.directory *
+
+      - name: Set up MSYS2 CLANGARM64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          update: true
+
+      - name: Install dependencies
+        run: packaging/MSWindows/SETUP_arm64.sh
+
+      - name: Build
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: >-
+          python packaging/MSWindows/BUILD.py
+          --no-sign --no-verpatch --no-cuda --no-service --no-docs --no-msi
+          --no-sbom --no-light --no-run --no-html5 --no-manual --no-putty
+          --no-paexec --no-desktop-logon
+          --zip --exe
+
+      - name: Upload zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: Xpra-arm64-zip
+          path: Xpra*.zip
+          if-no-files-found: error
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Xpra-arm64-installer
+          path: Xpra*Setup*.exe
+          if-no-files-found: error

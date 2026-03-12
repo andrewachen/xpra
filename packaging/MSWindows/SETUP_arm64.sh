@@ -54,6 +54,7 @@ fi
 
 # gssapi: Kerberos auth — not needed for plain TCP password auth, skip entirely.
 # pycryptodome / pycryptodomex: AES encryption — not needed for unencrypted TCP, skip.
+# pdfium: remote printing — not needed, skip.
 
 # Remaining Python build deps; pip fallback for anything not yet ported.
 for x in mako markupsafe typing_extensions platformdirs pip keyring idna; do

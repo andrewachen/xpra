@@ -30,17 +30,17 @@ class ScalingFilterTest(unittest.TestCase):
         b = self._make_backing("text")
         self.assertEqual(b._get_scaling_filter(3.0, 3.0), cairo.FILTER_NEAREST)
 
-    def test_text_non_integer_uses_good(self):
+    def test_text_non_integer_uses_best(self):
         b = self._make_backing("text")
-        self.assertEqual(b._get_scaling_filter(1.5, 1.5), cairo.FILTER_GOOD)
+        self.assertEqual(b._get_scaling_filter(1.5, 1.5), cairo.FILTER_BEST)
 
     def test_non_text_integer_2x_uses_good(self):
         b = self._make_backing("browser")
         self.assertEqual(b._get_scaling_filter(2.0, 2.0), cairo.FILTER_GOOD)
 
-    def test_no_scaling_uses_good(self):
+    def test_no_scaling_uses_best(self):
         b = self._make_backing("text")
-        self.assertEqual(b._get_scaling_filter(1.0, 1.0), cairo.FILTER_GOOD)
+        self.assertEqual(b._get_scaling_filter(1.0, 1.0), cairo.FILTER_BEST)
 
     def test_empty_content_type_uses_good(self):
         b = self._make_backing("")
@@ -50,19 +50,19 @@ class ScalingFilterTest(unittest.TestCase):
         b = self._make_backing("text")
         self.assertEqual(b._get_scaling_filter(2.0, 3.0), cairo.FILTER_NEAREST)
 
-    def test_asymmetric_mixed_scale_uses_good(self):
+    def test_asymmetric_mixed_scale_uses_best(self):
         b = self._make_backing("text")
-        self.assertEqual(b._get_scaling_filter(2.0, 1.5), cairo.FILTER_GOOD)
+        self.assertEqual(b._get_scaling_filter(2.0, 1.5), cairo.FILTER_BEST)
 
     def test_text_near_integer_2x_uses_nearest(self):
         """Pixel rounding can produce scale factors like 1.95 or 2.05."""
         b = self._make_backing("text")
         self.assertEqual(b._get_scaling_filter(1.95, 2.05), cairo.FILTER_NEAREST)
 
-    def test_text_outside_tolerance_uses_good(self):
-        """Scale factors more than 0.1 from an integer use bilinear."""
+    def test_text_outside_tolerance_uses_best(self):
+        """Text at non-integer scale uses Catmull-Rom (bicubic)."""
         b = self._make_backing("text")
-        self.assertEqual(b._get_scaling_filter(2.2, 2.2), cairo.FILTER_GOOD)
+        self.assertEqual(b._get_scaling_filter(2.2, 2.2), cairo.FILTER_BEST)
 
     def test_env_override_nearest(self):
         b = self._make_backing("browser")

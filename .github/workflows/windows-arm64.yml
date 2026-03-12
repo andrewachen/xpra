@@ -42,7 +42,7 @@ jobs:
           python packaging/MSWindows/BUILD.py
           --no-sign --no-verpatch --no-cuda --no-service --no-docs --no-msi
           --no-sbom --no-light --no-run --no-html5 --no-manual --no-putty
-          --no-paexec --no-desktop-logon
+          --no-paexec --no-desktop-logon --no-printing
           --zip --exe
 
       - name: Upload zip

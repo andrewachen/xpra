@@ -19,8 +19,8 @@ $PACMAN ${XPKG}libspng ${XPKG}libavif ${XPKG}gst-plugins-good ${XPKG}gst-plugins
 # libyuv: prefer the -git package, fall back to stable, skip if neither exists
 $PACMAN ${XPKG}libyuv-git || $PACMAN ${XPKG}libyuv || echo "Warning: libyuv not available for clangarm64, skipping"
 
-# Network layer
-$PACMAN ${XPKG}lz4 ${XPKG}xxhash heimdal-libs openssh sshpass ${XPKG}libsodium
+# Network layer (openssh/sshpass not installed — TCP-only client, no SSH transport)
+$PACMAN ${XPKG}lz4 ${XPKG}xxhash heimdal-libs ${XPKG}libsodium
 
 # pinentry: not available on all clangarm64 repositories yet
 $PACMAN ${XPKG}pinentry || echo "Warning: pinentry not available for clangarm64, skipping"
@@ -55,6 +55,8 @@ fi
 # gssapi: Kerberos auth — not needed for plain TCP password auth, skip entirely.
 # pycryptodome / pycryptodomex: AES encryption — not needed for unencrypted TCP, skip.
 # pdfium: remote printing — not needed, skip.
+# openssh/putty/paexec: SSH transport, remote exec — TCP-only client, skip.
+# openssl CLI: cert management tool — not needed, SSL libraries are bundled separately.
 
 # Remaining Python build deps; pip fallback for anything not yet ported.
 for x in mako markupsafe typing_extensions platformdirs pip keyring idna; do

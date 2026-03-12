@@ -92,7 +92,9 @@ class CairoBackingBase(WindowBackingBase):
             return FILTER_GOOD
         # use nearest-neighbor for text windows at integer upscale >= 2x
         if "text" in self.content_type:
-            if sx >= 2 and sy >= 2 and sx == int(sx) and sy == int(sy):
+            if (round(sx) >= 2 and round(sy) >= 2
+                    and abs(sx - round(sx)) <= 0.1
+                    and abs(sy - round(sy)) <= 0.1):
                 return FILTER_NEAREST
         return FILTER_GOOD
 
@@ -195,13 +197,9 @@ class CairoBackingBase(WindowBackingBase):
         gc.set_operator(Operator.SOURCE)
         gc.translate(x, y)
         if iw != width or ih != height:
-            sx, sy = width / iw, height / ih
-            gc.scale(sx, sy)
-            set_source_fn(gc, source, 0, 0)
-            gc.get_source().set_filter(self._get_scaling_filter(sx, sy))
-        else:
-            set_source_fn(gc, source, 0, 0)
+            gc.scale(width / iw, height / ih)
         gc.rectangle(0, 0, width, height)
+        set_source_fn(gc, source, 0, 0)
         gc.paint()
 
         if self.paint_box_line_width:

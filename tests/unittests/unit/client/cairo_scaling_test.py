@@ -54,6 +54,16 @@ class ScalingFilterTest(unittest.TestCase):
         b = self._make_backing("text")
         self.assertEqual(b._get_scaling_filter(2.0, 1.5), cairo.FILTER_GOOD)
 
+    def test_text_near_integer_2x_uses_nearest(self):
+        """Pixel rounding can produce scale factors like 1.95 or 2.05."""
+        b = self._make_backing("text")
+        self.assertEqual(b._get_scaling_filter(1.95, 2.05), cairo.FILTER_NEAREST)
+
+    def test_text_outside_tolerance_uses_good(self):
+        """Scale factors more than 0.1 from an integer use bilinear."""
+        b = self._make_backing("text")
+        self.assertEqual(b._get_scaling_filter(2.2, 2.2), cairo.FILTER_GOOD)
+
     def test_env_override_nearest(self):
         b = self._make_backing("browser")
         old = os.environ.get("XPRA_SCALING_FILTER")

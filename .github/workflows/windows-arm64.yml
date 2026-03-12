@@ -35,12 +35,19 @@ jobs:
       - name: Install dependencies
         run: packaging/MSWindows/SETUP_arm64.sh
 
+      - name: Install verpatch (x86 binary, runs under ARM64 emulation)
+        run: |
+          curl -sL https://api.nuget.org/v3-flatcontainer/verpatch/1.0.14/verpatch.1.0.14.nupkg -o verpatch.nupkg
+          python -c "import zipfile; zipfile.ZipFile('verpatch.nupkg').extract('lib/win/verpatch.exe', '.')"
+          cp lib/win/verpatch.exe "$MINGW_PREFIX/bin/"
+          rm -rf lib/win verpatch.nupkg
+
       - name: Build
         env:
           PYTHONUNBUFFERED: "1"
         run: >-
           python packaging/MSWindows/BUILD.py
-          --no-sign --no-verpatch --no-cuda --no-service --no-docs --no-msi
+          --no-sign --no-cuda --no-service --no-docs --no-msi
           --no-sbom --no-light --no-run --no-html5 --no-manual --no-putty
           --no-paexec --no-desktop-logon --no-printing
           --zip --exe

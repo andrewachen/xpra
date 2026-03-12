@@ -11,7 +11,7 @@ from typing import Any
 from collections.abc import Callable
 from cairo import (
     Context, ImageSurface, Format, Operator, OPERATOR_OVER, LINE_CAP_ROUND,
-    FILTER_NEAREST, FILTER_GOOD,
+    FILTER_NEAREST, FILTER_GOOD, FILTER_BEST,
 )
 
 from xpra.client.gui.paint_colors import get_paint_box_color
@@ -90,12 +90,14 @@ class CairoBackingBase(WindowBackingBase):
             return FILTER_NEAREST
         if override == "bilinear":
             return FILTER_GOOD
-        # use nearest-neighbor for text windows at integer upscale >= 2x
         if "text" in self.content_type:
+            # use nearest-neighbor for text windows at integer upscale >= 2x
             if (round(sx) >= 2 and round(sy) >= 2
                     and abs(sx - round(sx)) <= 0.1
                     and abs(sy - round(sy)) <= 0.1):
                 return FILTER_NEAREST
+            # use Catmull-Rom (bicubic) for text at non-integer scales
+            return FILTER_BEST
         return FILTER_GOOD
 
     def init(self, ww: int, wh: int, bw: int, bh: int) -> None:

@@ -4,11 +4,15 @@
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
+import os
 from math import pi, sin
 from time import monotonic
 from typing import Any
 from collections.abc import Callable
-from cairo import Context, ImageSurface, Format, Operator, OPERATOR_OVER, LINE_CAP_ROUND
+from cairo import (
+    Context, ImageSurface, Format, Operator, OPERATOR_OVER, LINE_CAP_ROUND,
+    FILTER_NEAREST, FILTER_GOOD,
+)
 
 from xpra.client.gui.paint_colors import get_paint_box_color
 from xpra.client.gui.window.backing import WindowBackingBase, fire_paint_callbacks, ALERT_MODE
@@ -77,6 +81,20 @@ class CairoBackingBase(WindowBackingBase):
         self.size = 0, 0
         self.render_size = 0, 0
         self.fps_image = None
+        self.content_type = ""
+
+    def _get_scaling_filter(self, sx: float, sy: float):
+        """Select cairo filter for scaling based on content type and scale factor."""
+        override = os.environ.get("XPRA_SCALING_FILTER", "").lower()
+        if override == "nearest":
+            return FILTER_NEAREST
+        if override == "bilinear":
+            return FILTER_GOOD
+        # use nearest-neighbor for text windows at integer upscale >= 2x
+        if "text" in self.content_type:
+            if sx >= 2 and sy >= 2 and sx == int(sx) and sy == int(sy):
+                return FILTER_NEAREST
+        return FILTER_GOOD
 
     def init(self, ww: int, wh: int, bw: int, bh: int) -> None:
         mod = self.size != (bw, bh) or self.render_size != (ww, wh)
@@ -177,9 +195,13 @@ class CairoBackingBase(WindowBackingBase):
         gc.set_operator(Operator.SOURCE)
         gc.translate(x, y)
         if iw != width or ih != height:
-            gc.scale(width / iw, height / ih)
+            sx, sy = width / iw, height / ih
+            gc.scale(sx, sy)
+            set_source_fn(gc, source, 0, 0)
+            gc.get_source().set_filter(self._get_scaling_filter(sx, sy))
+        else:
+            set_source_fn(gc, source, 0, 0)
         gc.rectangle(0, 0, width, height)
-        set_source_fn(gc, source, 0, 0)
         gc.paint()
 
         if self.paint_box_line_width:
@@ -327,6 +349,11 @@ class CairoBackingBase(WindowBackingBase):
     def cairo_draw_backing(self, context, backing) -> None:
         context.set_operator(Operator.SOURCE)
         context.set_source_surface(backing, 0, 0)
+        # apply scaling filter if the backing is being scaled (desktop-scaling)
+        w, h = self.size
+        ww, wh = self.render_size
+        if w and h and (ww != w or wh != h):
+            context.get_source().set_filter(self._get_scaling_filter(ww / w, wh / h))
         context.paint()
 
     def cairo_draw_pointer(self, context):

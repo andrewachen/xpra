@@ -166,6 +166,7 @@ class GTKXpraClient(GObjectXpraClient, UIXpraClient):
         self.gl_max_viewport_dims = 0, 0
         self.gl_texture_size_limit = 0
         self._cursors = weakref.WeakKeyDictionary()
+        self._last_cursor_data: tuple = ()
         # frame request hidden window:
         self.frame_request_window = None
         # group leader bits:
@@ -960,6 +961,8 @@ class GTKXpraClient(GObjectXpraClient, UIXpraClient):
             if cursor is None:
                 # use default:
                 cursor = get_default_cursor()
+        if cursor_data:
+            self._last_cursor_data = cursor_data
         for w in windows:
             w.set_cursor_data(cursor_data)
             # the cursor should only apply to the window contents (aka "drawingarea"),
@@ -969,7 +972,26 @@ class GTKXpraClient(GObjectXpraClient, UIXpraClient):
             # trays don't have a gdk window
             if gdkwin:
                 self._cursors[w] = cursor_data
-                gdkwin.set_cursor(cursor)
+                # If the window has a Win32 cursor subclass installed, update its
+                # HCURSOR holder directly. GDK's set_cursor calls Win32 SetCursor()
+                # which would override the subclass between WM_SETCURSOR messages.
+                subclass_info = getattr(w, "_cursor_subclass_info", None)
+                if subclass_info:
+                    holder = getattr(w, "_cursor_hcursor_holder", None)
+                    if holder is not None:
+                        if cursor:
+                            extract_fn = getattr(w, "_get_hcursor_from_gdk_cursor", None)
+                            if extract_fn:
+                                hcursor = extract_fn(cursor)
+                                if hcursor:
+                                    holder[0] = hcursor
+                                    w._cursor_ref = cursor  # prevent GC of Win32 HCURSOR
+                        else:
+                            # Cursor reset — clear so subclass falls through to default
+                            holder[0] = 0
+                            w._cursor_ref = None
+                else:
+                    gdkwin.set_cursor(cursor)
 
     def make_cursor(self, cursor_data: Sequence) -> Gdk.Cursor | None:
         # if present, try cursor ny name:

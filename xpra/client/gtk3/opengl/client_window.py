@@ -6,13 +6,49 @@
 
 from xpra.client.gtk3.window.window import ClientWindow
 from xpra.gtk.window import set_visual
+from xpra.os_util import gi_import, WIN32
 from xpra.util.objects import typedict
 from xpra.util.env import envbool
 from xpra.log import Logger
 
+Gdk = gi_import("Gdk")
+
 log = Logger("opengl", "window")
+cursorlog = Logger("opengl", "cursor")
 
 MONITOR_REINIT = envbool("XPRA_OPENGL_MONITOR_REINIT", False)
+
+if WIN32:
+    import ctypes
+    import ctypes.wintypes
+    import re
+
+    _HCURSOR_PATTERN = re.compile(r"GdkWin32Cursor at (0x[0-9a-fA-F]+)\)")
+
+    # LRESULT CALLBACK SubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR)
+    _SUBCLASSPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_longlong,    # LRESULT return
+        ctypes.c_void_p,      # HWND
+        ctypes.c_uint,        # UINT msg
+        ctypes.c_ulonglong,   # WPARAM
+        ctypes.c_longlong,    # LPARAM
+        ctypes.c_ulonglong,   # UINT_PTR uIdSubclass
+        ctypes.c_ulonglong,   # DWORD_PTR dwRefData
+    )
+
+    # Win32 API function signatures (set once at import time)
+    ctypes.windll.user32.WindowFromPoint.argtypes = [ctypes.wintypes.POINT]
+    ctypes.windll.user32.WindowFromPoint.restype = ctypes.c_void_p
+
+    ctypes.windll.comctl32.DefSubclassProc.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_ulonglong, ctypes.c_longlong]
+    ctypes.windll.comctl32.DefSubclassProc.restype = ctypes.c_longlong
+    ctypes.windll.comctl32.SetWindowSubclass.argtypes = [
+        ctypes.c_void_p, _SUBCLASSPROC, ctypes.c_ulonglong, ctypes.c_ulonglong]
+    ctypes.windll.comctl32.SetWindowSubclass.restype = ctypes.c_bool
+    ctypes.windll.comctl32.RemoveWindowSubclass.argtypes = [
+        ctypes.c_void_p, _SUBCLASSPROC, ctypes.c_ulonglong]
+    ctypes.windll.comctl32.RemoveWindowSubclass.restype = ctypes.c_bool
 
 
 class GLClientWindowBase(ClientWindow):
@@ -87,11 +123,157 @@ class GLClientWindowBase(ClientWindow):
         self._backing.paint_screen = True
 
     def destroy(self) -> None:
+        self._remove_cursor_subclass()
         self.remove_backing()
         super().destroy()
 
     def init_drawing_area(self) -> None:
         self.drawing_area = None
+
+    # ---- Win32 GL cursor fix ----
+    #
+    # On Win32, GL windows have a separate child HWND for the DrawingArea.
+    # GDK stores the cursor on the GdkWindow but its WM_SETCURSOR handler
+    # doesn't apply it correctly for this child HWND. We subclass the child
+    # HWND via SetWindowSubclass (comctl32) to intercept WM_SETCURSOR and
+    # call SetCursor with the correct HCURSOR ourselves.
+
+    def _get_hcursor_from_gdk_cursor(self, cursor) -> int:
+        # Extract the Win32 HCURSOR from GdkWin32Cursor's C struct at offset 48.
+        # Struct layout: GObject(24) + display*(8) + cursor_type(4)+pad(4) +
+        #                name*(8) + HCURSOR(8)
+        m = _HCURSOR_PATTERN.search(repr(cursor))
+        if not m:
+            cursorlog.warn("Warning: cannot parse GdkWin32Cursor repr: %s", repr(cursor)[:80])
+            return 0
+        c_ptr = int(m.group(1), 16)
+        try:
+            val = ctypes.c_void_p.from_address(c_ptr + 48).value or 0
+            cursorlog("extracted HCURSOR=%s from GdkWin32Cursor struct", hex(val) if val else 0)
+            return val
+        except Exception as e:
+            cursorlog.warn("Warning: failed reading HCURSOR at offset 48: %s", e)
+            return 0
+
+    def _get_hwnd_under_cursor(self) -> int:
+        # Returns the Win32 HWND currently under the mouse cursor.
+        try:
+            pt = ctypes.wintypes.POINT()
+            if not ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+                return 0
+            hwnd = ctypes.windll.user32.WindowFromPoint(pt)
+            if hwnd and ctypes.windll.user32.IsWindow(hwnd):
+                return hwnd
+        except Exception as e:
+            cursorlog.warn("Warning: WindowFromPoint failed: %s", e)
+        return 0
+
+    def _remove_cursor_subclass(self) -> None:
+        info = getattr(self, "_cursor_subclass_info", None)
+        if not info:
+            return
+        hwnd, callback, subclass_id = info
+        self._cursor_subclass_info = None
+        self._cursor_hcursor_holder = None
+        try:
+            import ctypes  # local import — called from destroy() on all platforms
+            ctypes.windll.comctl32.RemoveWindowSubclass(hwnd, callback, subclass_id)
+            cursorlog("removed cursor subclass from hwnd=%s wid=%#x", hex(hwnd), self.wid)
+        except Exception as e:
+            cursorlog.warn("Warning: RemoveWindowSubclass failed: %s", e)
+
+    def _install_cursor_subclass(self, hwnd: int, hcursor: int) -> None:
+        # Subclass the HWND to intercept WM_SETCURSOR and apply our cursor.
+        # Uses SetWindowSubclass (comctl32) which is safe and chainable.
+        existing = getattr(self, "_cursor_subclass_info", None)
+        if existing and existing[0] == hwnd:
+            # Already subclassed this HWND — update the cursor handle
+            self._cursor_hcursor_holder[0] = hcursor
+            cursorlog("updated HCURSOR=%s on existing subclass hwnd=%s wid=%#x",
+                      hex(hcursor), hex(hwnd), self.wid)
+            return
+
+        # Remove any old subclass first
+        self._remove_cursor_subclass()
+
+        WM_SETCURSOR = 0x0020
+        WM_NCDESTROY = 0x0082
+        HTCLIENT = 1
+        SUBCLASS_ID = 0xAC01  # arbitrary unique ID
+
+        # Mutable holder so we can update HCURSOR without re-subclassing
+        hcursor_holder = [hcursor]
+        self._cursor_hcursor_holder = hcursor_holder
+
+        comctl32 = ctypes.windll.comctl32
+
+        @_SUBCLASSPROC
+        def subclass_proc(h, msg, wparam, lparam, uid, ref_data):
+            try:
+                if msg == WM_SETCURSOR and (lparam & 0xFFFF) == HTCLIENT:
+                    hc = hcursor_holder[0]
+                    if hc:
+                        ctypes.windll.user32.SetCursor(ctypes.c_void_p(hc))
+                        return 1  # handled — prevents DefWindowProc from setting arrow
+                if msg == WM_NCDESTROY:
+                    comctl32.RemoveWindowSubclass(h, subclass_proc, SUBCLASS_ID)
+                    cursorlog("cursor subclass removed on WM_NCDESTROY wid=%#x", self.wid)
+            except Exception as e:
+                cursorlog.warn("Warning: cursor subclass error in WndProc: %s", e)
+            return comctl32.DefSubclassProc(h, msg, wparam, lparam)
+
+        result = comctl32.SetWindowSubclass(hwnd, subclass_proc, SUBCLASS_ID, 0)
+        if result:
+            # Store strong references to prevent GC of the callback
+            self._cursor_subclass_info = (hwnd, subclass_proc, SUBCLASS_ID)
+            cursorlog("installed cursor subclass on hwnd=%s hcursor=%s wid=%#x",
+                      hex(hwnd), hex(hcursor), self.wid)
+        else:
+            cursorlog.warn("Warning: SetWindowSubclass failed for hwnd=%s wid=%#x",
+                           hex(hwnd), self.wid)
+
+    def _apply_cursor_on_enter(self, _widget, event=None) -> None:
+        # Win32 only: apply the correct cursor when the pointer enters the
+        # GL DrawingArea. If a subclass is already installed, its HCURSOR
+        # holder is kept current by set_windows_cursor — just apply it.
+        # On first enter, build a cursor and install the subclass.
+        info = getattr(self, "_cursor_subclass_info", None)
+        if info:
+            holder = getattr(self, "_cursor_hcursor_holder", None)
+            if holder and holder[0]:
+                ctypes.windll.user32.SetCursor(ctypes.c_void_p(holder[0]))
+            return
+
+        cursor_data = getattr(self, "cursor_data", ()) or getattr(self._client, "_last_cursor_data", ())
+        if not cursor_data:
+            return
+
+        cursor = None
+        try:
+            cursor = self._client.make_cursor(cursor_data)
+        except Exception as e:
+            cursorlog.warn("Warning: make_cursor failed on enter-notify: %s", e)
+            return
+        if cursor is None:
+            return
+
+        hcursor = self._get_hcursor_from_gdk_cursor(cursor)
+        if not hcursor:
+            # Fallback: use system I-beam cursor
+            hcursor = ctypes.windll.user32.LoadCursorW(0, 32513)  # IDC_IBEAM
+            cursorlog("using IDC_IBEAM fallback for wid=%#x", self.wid)
+
+        # Immediate SetCursor so cursor shows right now
+        ctypes.windll.user32.SetCursor(ctypes.c_void_p(hcursor))
+
+        # Install subclass on the HWND under the cursor so WM_SETCURSOR
+        # keeps applying our cursor (instead of GDK resetting to arrow).
+        hwnd = self._get_hwnd_under_cursor()
+        if hwnd and hcursor:
+            self._install_cursor_subclass(hwnd, hcursor)
+
+        # Keep a reference to the GdkCursor to prevent GC of the underlying Win32 cursor
+        self._cursor_ref = cursor
 
     def new_backing(self, bw: int, bh: int) -> None:
         widget = super().new_backing(bw, bh)
@@ -107,6 +289,12 @@ class GLClientWindowBase(ClientWindow):
             self.drawing_area.set_size_request(*minsize)
         self.add(widget)
         self.drawing_area = widget
+        # Win32 GL cursor fix: GDK doesn't handle WM_SETCURSOR for the GL
+        # DrawingArea's child HWND. We intercept enter-notify to subclass
+        # the HWND and apply the cursor directly via Win32 SetCursor.
+        if WIN32:
+            widget.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK)
+            widget.connect_after("enter-notify-event", self._apply_cursor_on_enter)
         # maybe redundant?:
         self.apply_geometry_hints(self.geometry_hints)
 

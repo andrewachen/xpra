@@ -47,10 +47,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: >-
           python packaging/MSWindows/BUILD.py
-          --no-light --no-sign --no-sbom --no-msi --no-run
-          --no-cuda --no-printing
-          --no-html5 --no-manual
-          --no-putty --no-openssh --no-openssl --no-paexec --no-desktop-logon
+          --light --no-sign --no-sbom --no-msi --no-run --no-printing
 
       - name: Upload zip
         uses: actions/upload-artifact@v4

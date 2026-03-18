@@ -1100,7 +1100,7 @@ class SessionInfo(Gtk.Window):
 
         # grid 3:
         self.encoder_info_box = Gtk.VBox(spacing=4)
-        self.encoder_info_box.add(title_box("Window Encoders"))
+        self.encoder_info_box.add(title_box("Window Encoders and Renderers"))
         self.encoder_labels = {}
         al = Gtk.Alignment(xalign=0.5, yalign=0.5, xscale=1.0, yscale=0.0)
         al.set_margin_start(10)
@@ -1175,29 +1175,38 @@ class SessionInfo(Gtk.Window):
             if self.client.client_supports_opengl:
                 self.opengl_label.set_text(str(gl))
 
-            # update encoder labels:
-            server_last_info = self.last_info()
-            if server_last_info:
-                window_encoder_stats = self.get_window_encoder_stats()
-                # log("window_encoder_stats=%s", window_encoder_stats)
-                for wid in list(self.encoder_labels):
-                    if wid not in window_encoder_stats:
-                        self.encoder_info_box.remove(self.encoder_labels.pop(wid))
-                for wid, props in window_encoder_stats.items():
-                    title = props.get("title", "")
-                    encoder = bytestostr(props.get("", "?"))
-                    display = "%s - %s (%s)" % (wid, title, encoder) if title else "%s (%s)" % (wid, encoder)
+            # update encoder and renderer labels:
+            id_to_window = getattr(self.client, "_id_to_window", {})
+            window_encoder_stats = self.get_window_encoder_stats()
+            # remove labels for windows that no longer exist:
+            for wid in list(self.encoder_labels):
+                if wid not in id_to_window:
+                    self.encoder_info_box.remove(self.encoder_labels.pop(wid))
+            # update or create labels for all windows:
+            for wid, win in tuple(id_to_window.items()):
+                renderer = "OpenGL" if win.is_GL() else "Cairo"
+                props = window_encoder_stats.get(wid, {})
+                title = props.get("title", "")
+                if not title:
+                    title = (win.get_title() if hasattr(win, "get_title") else "") or ""
+                    title = (title[:40] + "\u2026") if len(title) > 40 else title
+                encoder = bytestostr(props.get("", "")) if props else ""
+                if encoder:
+                    detail = "%s \u2192 %s" % (encoder, renderer)
+                else:
+                    detail = renderer
+                display = "%s - %s (%s)" % (wid, title, detail) if title else "%s (%s)" % (wid, detail)
+                if wid in self.encoder_labels:
+                    lbl = self.encoder_labels[wid]
+                    lbl.set_text(display)
+                else:
+                    lbl = slabel(display)
+                    lbl.show()
+                    self.encoder_labels[wid] = lbl
+                    self.encoder_info_box.add(lbl)
+                if props:
                     info = " ".join("%s=%s" % (k, v) for k, v in props.items() if k not in ("", "title"))
-                    if wid in self.encoder_labels:
-                        lbl = self.encoder_labels[wid]
-                        lbl.set_text(display)
-                        lbl.set_tooltip_text(info)
-                    else:
-                        lbl = slabel(display)
-                        lbl.set_tooltip_text(info)
-                        lbl.show()
-                        self.encoder_labels[wid] = lbl
-                        self.encoder_info_box.add(lbl)
+                    lbl.set_tooltip_text(info)
         return True
 
     def get_window_encoder_stats(self) -> dict:

@@ -1007,6 +1007,11 @@ class WindowClient(StubClientMixin):
 
     def show_window(self, wid: int, window, metadata, override_redirect: bool) -> None:
         window.show_all()
+        # apply the current cursor so newly-shown windows don't briefly
+        # show an arrow before the next server cursor packet arrives:
+        last_cursor = getattr(self, "_last_cursor_data", ())
+        if last_cursor:
+            self.set_windows_cursor([window], last_cursor)
         if override_redirect and self.should_force_grab(metadata):
             grablog.warn("forcing grab for OR window %#x, matches %s", wid, OR_FORCE_GRAB)
             self.window_grab(wid, window)

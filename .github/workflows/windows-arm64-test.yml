@@ -1,0 +1,58 @@
+name: Windows ARM64 Unit Tests
+
+on:
+  push:
+    branches:
+      - '**'
+      - '!master'
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Unit tests (Windows ARM64)
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up MSYS2 CLANGARM64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          update: true
+          install: >-
+            mingw-w64-clang-aarch64-python
+            mingw-w64-clang-aarch64-python-gobject
+            mingw-w64-clang-aarch64-gtk3
+            mingw-w64-clang-aarch64-python-pillow
+
+      - name: Install optional test dependencies
+        run: |
+          XPKG="${MINGW_PACKAGE_PREFIX}-"
+          for pkg in numpy cryptography netifaces setproctitle paramiko; do
+            pacman --noconfirm --needed -S ${XPKG}python-${pkg} || echo "Warning: python-${pkg} not available, skipping"
+          done
+
+      - name: Run unit tests
+        env:
+          PYTHONUNBUFFERED: "1"
+          XPRA_NOTTY: "1"
+          XPRA_SKIP_UI: "1"
+          XPRA_TEST_COVERAGE: "0"
+        run: |
+          SRC="$(pwd)"
+          export PYTHONPATH="$SRC:$SRC/tests/unittests"
+          cd tests/unittests
+          python -m unittest \
+            unit.client.gl_cursor_probe_test \
+            unit.client.border_test \
+            unit.client.cairo_scaling_test \
+            unit.client.opengl_eligibility_test \
+            unit.client.opengl_scaling_test \
+            unit.client.paint_colors_test \
+            -v

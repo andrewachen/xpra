@@ -682,9 +682,9 @@ def _probe_hcursor_offset() -> int:
         query = GObjectLib.type_query(type(cursor_a).__gtype__)
         scan_limit = query.instance_size
         cursorlog("_probe_hcursor_offset: GdkWin32Cursor instance_size=%d", scan_limit)
-    except Exception:
-        scan_limit = 128
-        cursorlog("_probe_hcursor_offset: type_query failed, using scan_limit=%d", scan_limit)
+    except Exception as e:
+        cursorlog.warn("Warning: cannot query GdkWin32Cursor instance size: %s", e)
+        return -1
 
     ptr_size = sizeof(c_void_p)
     for offset in range(0, scan_limit, ptr_size):
@@ -712,10 +712,9 @@ def _probe_hcursor_offset() -> int:
     cursorlog.warn("Warning: failed to discover HCURSOR offset in GdkWin32Cursor")
     return -1
 
-# Win32 message constants for the subclass proc
-_WM_SETCURSOR = 0x0020
-_WM_NCDESTROY = 0x0082
-_HTCLIENT = 1
+# Unique ID for our SetWindowSubclass registration. The comctl32 subclass
+# API uses this to distinguish multiple subclasses on the same HWND.
+# Arbitrary value; just needs to be unique within this process.
 _GL_CURSOR_SUBCLASS_ID = 0xAC01
 
 
@@ -760,12 +759,12 @@ def _install_gl_cursor_subclass(window, hwnd: int, hcursor: int) -> None:
     @SUBCLASSPROC
     def subclass_proc(h, msg, wparam, lparam, uid, ref_data):
         try:
-            if msg == _WM_SETCURSOR and (lparam & 0xFFFF) == _HTCLIENT:
+            if msg == win32con.WM_SETCURSOR and (lparam & 0xFFFF) == win32con.HTCLIENT:  # LOWORD = hit-test
                 hc = hcursor_holder[0]
                 if hc:
                     SetCursor(c_void_p(hc))
                     return 1  # handled — prevents DefWindowProc from setting arrow
-            if msg == _WM_NCDESTROY:
+            if msg == win32con.WM_NCDESTROY:
                 RemoveWindowSubclass(h, subclass_proc, _GL_CURSOR_SUBCLASS_ID)
                 window._gl_cursor_info = None
                 window._gl_cursor_holder = None

@@ -1315,6 +1315,12 @@ def create_exe(args) -> str:
         elif line.find("Xpra Shadow Server") >= 0 and args.light:
             # no shadow server in light builds
             continue
+        elif line.startswith("LicenseFile="):
+            # skip the EULA/license page
+            continue
+        elif line.find("LaunchProgram") >= 0:
+            # don't launch after install by default
+            line = line.rstrip() + " unchecked\n"
         elif line.find("Command Manual") >= 0 and not args.docs:
             # remove link to the manual:
             continue

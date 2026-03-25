@@ -34,15 +34,18 @@ cdef extern from "mf_decode.h":
 
     ctypedef struct MFDecodedFrame:
         uint8_t *y_data
-        uint8_t *uv_data
+        uint8_t *u_data
+        uint8_t *v_data
         int      y_stride
-        int      uv_stride
+        int      u_stride
+        int      v_stride
         int      width
         int      height
         int      full_range
         int      us_input
         int      us_output
         int      us_extract
+        int      us_split
 
     int MF_CODEC_H264
     int MF_CODEC_HEVC
@@ -247,29 +250,26 @@ cdef class Decoder:
             raise RuntimeError("mf decode error: %s (detail: %s, hr=0x%08X)" % (
                 mf_decode_status_str(status).decode("latin-1"), detail, last_hr))
 
-        # de-interleave NV12 UV into separate U and V planes for YUV420P output.
-        # The NV12 GL upload path (GL_RG + half-width texture) has rendering issues
-        # with GL_TEXTURE_RECTANGLE coordinate mapping. YUV420P uses the well-tested
-        # per-plane GL_RED upload with divs-based coordinate scaling in the shader.
+        # UV de-interleave (NV12→YUV420P) is done in C with SIMD (libyuv SplitUVPlane).
+        # YUV420P avoids GL_RG upload bugs on the D3D12 OpenGL compat layer.
         cdef int y_size = frame.y_stride * frame.height
-        cdef int uv_size = frame.uv_stride * (frame.height // 2)
-        cdef int uv_stride = frame.uv_stride // 2
+        cdef int u_size = frame.u_stride * (frame.height // 2)
+        cdef int v_size = frame.v_stride * (frame.height // 2)
         copy_start = monotonic()
         y_plane = frame.y_data[:y_size]
-        uv_raw = frame.uv_data[:uv_size]
-        u_plane = uv_raw[0::2]
-        v_plane = uv_raw[1::2]
+        u_plane = frame.u_data[:u_size]
+        v_plane = frame.v_data[:v_size]
         copy_end = monotonic()
         pixels = (y_plane, u_plane, v_plane)
-        strides = (frame.y_stride, uv_stride, uv_stride)
+        strides = (frame.y_stride, frame.u_stride, frame.v_stride)
 
         self.frames += 1
         cdef int us_copy = int((copy_end - copy_start) * 1000000)
         cdef int us_total = int((copy_end - start) * 1000000)
-        log("mf decoded %8d bytes %dx%d in %dms: input=%dus output=%dus extract=%dus copy=%dus (%.1fMB)",
+        log("mf decoded %8d bytes %dx%d in %dms: input=%dus output=%dus extract=%dus split=%dus copy=%dus (%.1fMB)",
             src_len, frame.width, frame.height, (us_total + 500) // 1000,
-            frame.us_input, frame.us_output, frame.us_extract, us_copy,
-            (y_size + uv_size) / 1048576.0)
+            frame.us_input, frame.us_output, frame.us_extract, frame.us_split, us_copy,
+            (y_size + u_size + v_size) / 1048576.0)
 
         full_range = options.boolget("full-range")
         return ImageWrapper(0, 0, self.width, self.height,

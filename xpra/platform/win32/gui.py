@@ -634,11 +634,31 @@ def remove_window_hooks(window) -> None:
 
 # ---- GL DrawingArea cursor subclass ----
 #
-# On Win32, GL windows have a separate child HWND for the DrawingArea.
-# GDK's WM_SETCURSOR handler doesn't apply the cursor to this child HWND,
-# so it always shows the arrow cursor. We subclass the child HWND via
-# comctl32 SetWindowSubclass to intercept WM_SETCURSOR and call SetCursor
-# with the correct HCURSOR ourselves.
+# On Win32, GL windows have a child HWND for the DrawingArea (promoted
+# to native by gdk_win32_window_get_handle → gdk_window_ensure_native).
+# After WGL context creation (SetPixelFormat / wglCreateContext), the
+# OpenGL driver may subclass this HWND, replacing GDK's WndProc with
+# its own. The driver's WndProc handles WM_SETCURSOR by calling
+# SetCursor(arrow) without forwarding to GDK, so gdkwin.set_cursor()
+# has no effect. We re-subclass the HWND via comctl32 SetWindowSubclass
+# to intercept WM_SETCURSOR before the driver's handler.
+
+def _get_wndproc(hwnd: int) -> int:
+    """Get the WndProc address for an HWND (diagnostic only).
+    Uses GetWindowLongPtrW for 64-bit correctness."""
+    try:
+        from ctypes import windll
+        from ctypes.wintypes import LONG as c_long
+        fn = windll.user32.GetWindowLongPtrW
+        fn.argtypes = [HWND, c_long]
+        fn.restype = c_void_p
+        return fn(hwnd, win32con.GWL_WNDPROC) or 0
+    except Exception:
+        try:
+            return GetWindowLongW(hwnd, win32con.GWL_WNDPROC) or 0
+        except Exception:
+            return 0
+
 
 # GDK's GdkWin32Cursor struct stores the Win32 HCURSOR handle, but
 # there's no public accessor function. We find the field offset at
@@ -813,6 +833,15 @@ def _update_gl_cursor(window, cursor) -> bool:
     holder = getattr(window, "_gl_cursor_holder", None)
     if holder is None:
         return False
+    # One-shot diagnostic: compare WndProc now (post-WGL) to realize time (pre-WGL)
+    realize_wndproc = getattr(window, "_gl_wndproc_at_realize", None)
+    if realize_wndproc is not None:
+        hwnd = info[0]
+        current_wndproc = _get_wndproc(hwnd)
+        cursorlog("gl cursor: WndProc at cursor update: %s (was %s at realize, changed=%s)",
+                  hex(current_wndproc), hex(realize_wndproc),
+                  current_wndproc != realize_wndproc)
+        window._gl_wndproc_at_realize = None  # only log once
     if not cursor:
         holder[0] = 0
         window._gl_cursor_ref = None
@@ -840,12 +869,21 @@ def setup_gl_drawing_area(window, widget) -> None:
             cursorlog.warn("Warning: GL DrawingArea has no HWND, cursor subclass not installed")
             return
 
-        # Check if parent window has a different HWND (for diagnostics)
+        # Diagnostic: log HWND hierarchy and WndProc addresses.
+        # If the OpenGL driver subclasses the HWND (after WGL context creation),
+        # the WndProc here (pre-WGL) will differ from the WndProc at cursor
+        # update time (post-WGL). This proves why gdkwin.set_cursor() fails.
         parent_hwnd = get_window_handle(window)
+        child_wndproc = _get_wndproc(hwnd)
+        parent_wndproc = _get_wndproc(parent_hwnd)
         cursorlog("gl cursor: parent_hwnd=%s, child_hwnd=%s, same=%s",
                   hex(parent_hwnd) if parent_hwnd else 0,
                   hex(hwnd),
                   parent_hwnd == hwnd)
+        cursorlog("gl cursor: WndProc at realize: child=%s, parent=%s, match=%s",
+                  hex(child_wndproc), hex(parent_wndproc),
+                  child_wndproc == parent_wndproc)
+        window._gl_wndproc_at_realize = child_wndproc
 
         # Check if GDK already has a cursor set on this widget
         gdkwin = w.get_window()

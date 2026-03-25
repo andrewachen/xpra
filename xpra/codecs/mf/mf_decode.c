@@ -19,6 +19,10 @@
 #include <stdarg.h>
 #include <string.h>
 
+#ifdef HAVE_LIBYUV
+#include <libyuv/planar_functions.h>
+#endif
+
 /* MF_LOW_LATENCY may not be defined in older SDK headers.
    GUID from https://learn.microsoft.com/en-us/windows/win32/medfound/mf-low-latency */
 #ifndef MF_LOW_LATENCY
@@ -42,6 +46,10 @@ struct MFDecoder {
     int              height;
     int              is_hw;
     int              provides_samples; /* MFT allocates its own output samples */
+    /* reusable buffers for NV12→YUV420P UV de-interleave */
+    uint8_t         *u_buf;
+    uint8_t         *v_buf;
+    int              uv_buf_alloc;    /* allocated size per plane in bytes */
     HRESULT          last_hr;         /* last failing HRESULT for diagnostics */
     char             last_error[128]; /* human-readable description of last error */
 };
@@ -112,6 +120,66 @@ static void zero_frame(MFDecodedFrame *frame) {
     memset(frame, 0, sizeof(*frame));
 }
 
+/* De-interleave NV12 UV plane into separate U and V planes (YUV420P).
+   Uses libyuv SplitUVPlane (NEON/SSE SIMD) when available, plain C fallback otherwise.
+   Reuses decoder-owned buffers to avoid per-frame allocation. */
+static int split_nv12_uv(MFDecoder *dec, MFDecodedFrame *frame) {
+    int uv_width  = frame->width / 2;
+    int uv_height = frame->height / 2;
+    int u_stride  = uv_width;
+    int plane_size = u_stride * uv_height;
+
+    /* grow reusable buffers if needed */
+    if (plane_size > dec->uv_buf_alloc) {
+        free(dec->u_buf);
+        free(dec->v_buf);
+        dec->u_buf = (uint8_t *)malloc(plane_size);
+        dec->v_buf = (uint8_t *)malloc(plane_size);
+        if (!dec->u_buf || !dec->v_buf) {
+            free(dec->u_buf);
+            free(dec->v_buf);
+            dec->u_buf = NULL;
+            dec->v_buf = NULL;
+            dec->uv_buf_alloc = 0;
+            return 0;
+        }
+        dec->uv_buf_alloc = plane_size;
+    }
+
+    long long t0 = usec_now();
+
+#ifdef HAVE_LIBYUV
+    SplitUVPlane(frame->u_data,  /* src: NV12 interleaved UV (stored in u_data temporarily) */
+                 frame->u_stride, /* src stride: NV12 UV row stride */
+                 dec->u_buf, u_stride,
+                 dec->v_buf, u_stride,
+                 uv_width, uv_height);
+#else
+    /* plain C fallback — same logic, no SIMD */
+    {
+        int row, x;
+        for (row = 0; row < uv_height; row++) {
+            const uint8_t *src = frame->u_data + row * frame->u_stride;
+            uint8_t *du = dec->u_buf + row * u_stride;
+            uint8_t *dv = dec->v_buf + row * u_stride;
+            for (x = 0; x < uv_width; x++) {
+                du[x] = src[2 * x];
+                dv[x] = src[2 * x + 1];
+            }
+        }
+    }
+#endif
+
+    long long t1 = usec_now();
+    frame->us_split = (int)(t1 - t0);
+
+    frame->u_data   = dec->u_buf;
+    frame->v_data   = dec->v_buf;
+    frame->u_stride = u_stride;
+    frame->v_stride = u_stride;
+    return 1;
+}
+
 /* Get padded dimensions from the output media type */
 static void get_padded_size(MFDecoder *dec, int *padded_w, int *padded_h) {
     *padded_w = dec->width;
@@ -155,16 +223,18 @@ static int try_extract_2d(MFDecoder *dec, IMFSample *sample, MFDecodedFrame *fra
     frame->width     = padded_w;
     frame->height    = padded_h;
     frame->y_stride  = (pitch < 0) ? -pitch : pitch;
-    frame->uv_stride = frame->y_stride;
     frame->y_data    = (uint8_t *)data;
-    frame->uv_data   = (uint8_t *)data + frame->y_stride * padded_h;
+    /* store NV12 interleaved UV pointer temporarily in u_data/u_stride;
+       split_nv12_uv() will de-interleave into separate U and V planes */
+    frame->u_data    = (uint8_t *)data + frame->y_stride * padded_h;
+    frame->u_stride  = frame->y_stride;
 
     /* keep the 2D buffer locked; store as locked_buffer for cleanup.
        IMF2DBuffer inherits from IMFMediaBuffer so this cast is safe. */
     dec->locked_buffer = (IMFMediaBuffer *)buf2d;
     dec->locked_is_2d = 1;
 
-    mf_log("extract_nv12(2D): %dx%d stride=%d (pitch=%ld)", padded_w, padded_h, frame->y_stride, (long)pitch);
+    mf_log("mf extract(2D): %dx%d stride=%d (pitch=%ld)", padded_w, padded_h, frame->y_stride, (long)pitch);
     return 1;
 }
 
@@ -204,11 +274,9 @@ static MFDecodeStatus extract_1d(MFDecoder *dec, IMFSample *sample, MFDecodedFra
     } else {
         frame->y_stride = (padded_w + 15) & ~15;
     }
-    frame->uv_stride = frame->y_stride;
-
     expected_size = (DWORD)(frame->y_stride * padded_h * 3 / 2);
     if (cur_len < expected_size) {
-        mf_log("extract_nv12(1D): buffer too small: %lu < %lu (stride=%d, %dx%d)",
+        mf_log("mf extract(1D): buffer too small: %lu < %lu (stride=%d, %dx%d)",
                (unsigned long)cur_len, (unsigned long)expected_size,
                frame->y_stride, padded_w, padded_h);
         IMFMediaBuffer_Unlock(buf);
@@ -221,9 +289,12 @@ static MFDecodeStatus extract_1d(MFDecoder *dec, IMFSample *sample, MFDecodedFra
     }
 
     frame->y_data  = (uint8_t *)data;
-    frame->uv_data = (uint8_t *)data + frame->y_stride * padded_h;
+    /* store NV12 interleaved UV pointer temporarily in u_data/u_stride;
+       split_nv12_uv() will de-interleave into separate U and V planes */
+    frame->u_data  = (uint8_t *)data + frame->y_stride * padded_h;
+    frame->u_stride = frame->y_stride;
 
-    mf_log("extract_nv12(1D): %dx%d stride=%d cur_len=%lu", padded_w, padded_h,
+    mf_log("mf extract(1D): %dx%d stride=%d cur_len=%lu", padded_w, padded_h,
            frame->y_stride, (unsigned long)cur_len);
     return MF_DEC_OK;
 }
@@ -258,8 +329,16 @@ static MFDecodeStatus extract_nv12(MFDecoder *dec, IMFSample *sample, MFDecodedF
         hr = IMFMediaType_GetUINT32(dec->output_type, &MF_MT_VIDEO_NOMINAL_RANGE, &nom_range);
         frame->full_range = (SUCCEEDED(hr) && nom_range == MFNominalRange_0_255) ? 1 : 0;
 
-        mf_log("extract_nv12: %dx%d stride=%d extract=%dus full_range=%d",
-               frame->width, frame->height, frame->y_stride, frame->us_extract, frame->full_range);
+        /* de-interleave NV12 UV into separate U and V planes for YUV420P output */
+        if (!split_nv12_uv(dec, frame)) {
+            snprintf(dec->last_error, sizeof(dec->last_error), "UV de-interleave allocation failed");
+            dec->last_hr = E_OUTOFMEMORY;
+            st = MF_DEC_ERROR;
+        }
+
+        mf_log("mf extract: %dx%d stride=%d extract=%dus split=%dus full_range=%d",
+               frame->width, frame->height, frame->y_stride,
+               frame->us_extract, frame->us_split, frame->full_range);
     }
 
     return st;
@@ -296,7 +375,7 @@ retry_output:
             if (buf_size == 0)
                 buf_size = dec->width * dec->height * 3 / 2;  /* NV12 size */
 
-            mf_log("try_get_output: allocating output sample, buf_size=%lu", (unsigned long)buf_size);
+            mf_log("mf output: allocating output sample, buf_size=%lu", (unsigned long)buf_size);
             hr = MFCreateMemoryBuffer(buf_size, &dec->output_buffer);
             if (FAILED(hr))
                 return set_error(dec, hr, "MFCreateMemoryBuffer(output)");
@@ -322,7 +401,7 @@ retry_output:
     }
 
     hr = IMFTransform_ProcessOutput(dec->transform, 0, 1, &out_buf, &status);
-    mf_log("ProcessOutput: hr=0x%08lX status=0x%lX provides_samples=%d",
+    mf_log("mf ProcessOutput: hr=0x%08lX status=0x%lX provides_samples=%d",
            (unsigned long)hr, (unsigned long)status, dec->provides_samples);
 
     if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
@@ -342,7 +421,7 @@ retry_output:
 
             GUID new_subtype;
             IMFMediaType_GetGUID(new_type, &MF_MT_SUBTYPE, &new_subtype);
-            mf_log("stream change: available type %lu: {%08lX-%04X-%04X-...}",
+            mf_log("mf stream change: available type %lu: {%08lX-%04X-%04X-...}",
                    (unsigned long)i, (unsigned long)new_subtype.Data1,
                    (unsigned)new_subtype.Data2, (unsigned)new_subtype.Data3);
             if (IsEqualGUID(&new_subtype, &MFVideoFormat_NV12)) {
@@ -383,7 +462,7 @@ retry_output:
             mf_log("mf error: %s", dec->last_error);
             return MF_DEC_ERROR;
         }
-        mf_log("stream change: renegotiated to %dx%d", dec->width, dec->height);
+        mf_log("mf stream change: renegotiated to %dx%d", dec->width, dec->height);
         /* input was already consumed; retry output with new type */
         if (++retries >= MAX_OUTPUT_RETRIES) {
             snprintf(dec->last_error, sizeof(dec->last_error), "stream change: too many retries (%d)", retries);
@@ -437,6 +516,11 @@ MFDecodeStatus mf_decode_startup(void) {
     }
 
     mf_log("mf_decode_startup: MediaFoundation started successfully");
+#ifdef HAVE_LIBYUV
+    mf_log("mf_decode_startup: UV de-interleave using libyuv SplitUVPlane (SIMD)");
+#else
+    mf_log("mf_decode_startup: UV de-interleave using plain C fallback");
+#endif
     g_mf_started = 1;
     return MF_DEC_OK;
 }
@@ -728,6 +812,8 @@ void mf_decoder_destroy(MFDecoder *dec) {
     if (dec->d3d_device)
         ID3D11Device_Release(dec->d3d_device);
 
+    free(dec->u_buf);
+    free(dec->v_buf);
     free(dec);
 }
 
@@ -773,7 +859,7 @@ MFDecodeStatus mf_decoder_decode(MFDecoder *dec,
     if (hr == MF_E_NOTACCEPTING) {
         /* MFT's input buffer is full. Drain one output frame to make room,
            then re-submit our input sample (which we still hold). */
-        mf_log("decode: MF_E_NOTACCEPTING, draining output first");
+        mf_log("mf decode: MF_E_NOTACCEPTING, draining output first");
         MFDecodeStatus st = try_get_output(dec, frame);
         if (st == MF_DEC_OK) {
             /* got a decoded frame; also submit our pending input while we're here */

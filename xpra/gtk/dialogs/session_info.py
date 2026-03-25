@@ -329,6 +329,15 @@ def save_graph(_ebox, btn, graph) -> None:
         log.warn(f"Warning: unknown chooser response: {response}")
 
 
+def format_encoder_pipeline(encoder: str, decoder: str = "", renderer: str = "") -> str:
+    parts = [encoder]
+    if decoder:
+        parts.append(decoder)
+    if renderer:
+        parts.append(renderer)
+    return " \u2192 ".join(parts)
+
+
 class SessionInfo(Gtk.Window):
 
     def __init__(self, client, session_name, conn, show_client=True, show_server=True):
@@ -1191,11 +1200,22 @@ class SessionInfo(Gtk.Window):
                     title = (win.get_title() if hasattr(win, "get_title") else "") or ""
                     title = (title[:40] + "\u2026") if len(title) > 40 else title
                 encoder = bytestostr(props.get("", "")) if props else ""
-                if encoder:
-                    detail = "%s \u2192 %s" % (encoder, renderer)
-                else:
-                    detail = renderer
-                display = "%s - %s (%s)" % (wid, title, detail) if title else "%s (%s)" % (wid, detail)
+                decoder = ""
+                if props.get("_video"):
+                    # show codec name with encoder in parens: "h265 (nvenc)"
+                    codec = bytestostr(props.get("codec", ""))
+                    if codec and encoder:
+                        encoder = "%s (%s)" % (codec, encoder)
+                    elif codec:
+                        encoder = codec
+                    try:
+                        backing = getattr(win, "_backing", None)
+                        vd = getattr(backing, "_video_decoder", None) if backing else None
+                        decoder = vd.get_type() if vd else ""
+                    except (AttributeError, RuntimeError):
+                        pass
+                pipeline = format_encoder_pipeline(encoder, decoder, renderer)
+                display = "%s - %s (%s)" % (wid, title, pipeline) if title else "%s (%s)" % (wid, pipeline)
                 if wid in self.encoder_labels:
                     lbl = self.encoder_labels[wid]
                     lbl.set_text(display)
@@ -1205,7 +1225,7 @@ class SessionInfo(Gtk.Window):
                     self.encoder_labels[wid] = lbl
                     self.encoder_info_box.add(lbl)
                 if props:
-                    info = " ".join("%s=%s" % (k, v) for k, v in props.items() if k not in ("", "title"))
+                    info = " ".join("%s=%s" % (k, v) for k, v in props.items() if k not in ("", "title", "_video", "codec"))
                     lbl.set_tooltip_text(info)
         return True
 
@@ -1236,6 +1256,7 @@ class SessionInfo(Gtk.Window):
                     if encoder_stats:
                         # video encoder is active
                         stats = dict(encoder_stats)
+                        stats["_video"] = True
                     else:
                         # fall back to last_used (e.g. "webp", "png") when video encoder is idle
                         last_used = bytestostr(v.get("last_used", ""))
@@ -1244,7 +1265,7 @@ class SessionInfo(Gtk.Window):
                         stats = {"": last_used}
                     win = id_to_window.get(wid)
                     title = (win.get_title() if win and hasattr(win, "get_title") else "") or ""
-                    stats["title"] = (title[:40] + "…") if len(title) > 40 else title
+                    stats["title"] = (title[:40] + "\u2026") if len(title) > 40 else title
                     window_encoder_stats[wid] = stats
         return window_encoder_stats
 

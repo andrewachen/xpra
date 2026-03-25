@@ -95,6 +95,19 @@ WINDOW_OVERFLOW_TOP = envbool("XPRA_WINDOW_OVERFLOW_TOP", False)
 AWT_RECENTER = envbool("XPRA_AWT_RECENTER", True)
 
 
+def snap_to_increment(w: int, h: int, hints: dict) -> tuple[int, int]:
+    """snap dimensions to the resize increment grid: base + increment * N"""
+    inc_w = hints.get("width_inc", 0)
+    inc_h = hints.get("height_inc", 0)
+    base_w = hints.get("base_width", 0)
+    base_h = hints.get("base_height", 0)
+    if inc_w > 1:
+        w -= max(w - base_w, 0) % inc_w
+    if inc_h > 1:
+        h -= max(h - base_h, 0) % inc_h
+    return w, h
+
+
 GDK_MOVERESIZE_MAP = {int(d): we for d, we in {
     MoveResize.SIZE_TOPLEFT: Gdk.WindowEdge.NORTH_WEST,
     MoveResize.SIZE_TOP: Gdk.WindowEdge.NORTH,
@@ -1051,6 +1064,22 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
             geomlog("%s for window %ix%i: started at %s, now at %s, delta=%s, button=%s, buttons=%s, data=%s",
                     dirstr, ww, wh, (x_root, y_root), (x, y), (dx, dy), button, buttons, data)
             if data:
+                move, resize = data
+                if resize:
+                    # snap to resize increment grid (ie: terminal character cells)
+                    rw, rh = int(resize[0]), int(resize[1])
+                    snapped = snap_to_increment(rw, rh, self.geometry_hints)
+                    if snapped != (rw, rh):
+                        # for directions that drag the left or top edge,
+                        # adjust position to keep the opposite edge fixed
+                        if move:
+                            mx, my = move
+                            if direction in (MoveResize.SIZE_BOTTOMLEFT, MoveResize.SIZE_LEFT, MoveResize.SIZE_TOPLEFT):
+                                mx += rw - snapped[0]
+                            if direction in (MoveResize.SIZE_TOPRIGHT, MoveResize.SIZE_TOP, MoveResize.SIZE_TOPLEFT):
+                                my += rh - snapped[1]
+                            move = (mx, my)
+                        data = move, snapped
                 # modifying the window is slower than moving the pointer,
                 # do it via a timer to batch things together
                 self.moveresize_data = data
@@ -1325,6 +1354,8 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         x, y, w, h = self.get_drawing_area_geometry()
         w = max(1, w)
         h = max(1, h)
+        # snap to grid so the server doesn't send a correction back
+        w, h = snap_to_increment(w, h, self.geometry_hints)
         state = self._window_state
         props = self.get_configure_client_properties()
         self._client_properties = {}

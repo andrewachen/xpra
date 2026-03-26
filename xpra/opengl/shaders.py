@@ -140,7 +140,7 @@ void main()
     vec2 pos = (gl_FragCoord.xy-viewport_pos.xy)/scaling;
     highp float y = texture(Y, pos).r {ymult};
     highp float u = (texture(UV, pos).r - 0.5) {umult};
-    highp float v = (texture(UV, pos).g - 0.5) {vmult};
+    highp float v = (texture(UV, pos).a - 0.5) {vmult};
 
     highp float r = y +           {e} * v;
     highp float g = y + {f} * u + {g} * v;

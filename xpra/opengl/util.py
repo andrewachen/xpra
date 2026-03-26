@@ -88,8 +88,8 @@ def set_alignment(width: int, rowstride: int, pixel_format: str) -> None:
         row_length = width + (rowstride - width * bytes_per_pixel) // bytes_per_pixel
     GL.glPixelStorei(GL.GL_UNPACK_ROW_LENGTH, row_length)
     GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, alignment)
-    # self.gl_marker("set_alignment%s GL_UNPACK_ROW_LENGTH=%i, GL_UNPACK_ALIGNMENT=%i",
-    #               (width, rowstride, pixel_format), row_length, alignment)
+    log("set_alignment: %s width=%d rowstride=%d bpp=%d → row_length=%d alignment=%d",
+        pixel_format, width, rowstride, bytes_per_pixel, row_length, alignment)
 
 
 def upload_rgba_texture(texture: int, width: int, height: int, pixels) -> None:

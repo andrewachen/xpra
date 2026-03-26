@@ -138,16 +138,15 @@ layout(location = 0) out vec4 frag_color;
 void main()
 {{
     vec2 pos = (gl_FragCoord.xy-viewport_pos.xy)/scaling;
+    highp float y = texture(Y, pos).r {ymult};
+    highp float u = (texture(UV, pos).r - 0.5) {umult};
+    highp float v = (texture(UV, pos).g - 0.5) {vmult};
 
-    // Diagnostic: output raw GL_LUMINANCE_ALPHA channel values as visible colors.
-    // Per GL spec for LUMINANCE_ALPHA: .r=.g=.b=byte0, .a=byte1.
-    // Red channel = .r (byte 0, should be U)
-    // Green channel = .a (byte 1, should be V)
-    // Blue channel = .g (should equal .r per spec)
-    // If .a works: red and green show different chroma patterns
-    // If .a=1.0 (driver bug): green is solid bright, red varies
-    // If .a=.r (both read byte 0): red == green everywhere
-    frag_color = vec4(texture(UV, pos).r, texture(UV, pos).a, texture(UV, pos).g, 1.0);
+    highp float r = y +           {e} * v;
+    highp float g = y + {f} * u + {g} * v;
+    highp float b = y + {d} * u;
+
+    frag_color = vec4(r, g, b, 1.0);
 }}
 """
 

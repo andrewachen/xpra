@@ -47,17 +47,10 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: >-
           python packaging/MSWindows/BUILD.py
-          --no-light --no-sign --no-sbom --no-msi --no-run
+          --no-light --no-sign --no-sbom --no-msi --no-zip --no-run
           --no-cuda --no-printing
           --no-html5 --no-manual
           --no-putty --no-openssh --no-openssl --no-paexec --no-desktop-logon
-
-      - name: Upload zip
-        uses: actions/upload-artifact@v4
-        with:
-          name: Xpra-arm64-zip
-          path: Xpra*.zip
-          if-no-files-found: error
 
       - name: Upload installer
         uses: actions/upload-artifact@v4

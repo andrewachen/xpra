@@ -16,6 +16,9 @@ directly with NO blank line between them:
     Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
     Sponsored-By: Netflix
 
+`Sponsored-By` is for commits and PR descriptions only — NOT for issue/PR
+comments.
+
 ## Copyright
 
 Every new file MUST have the standard Xpra copyright header at the very top,

@@ -261,6 +261,8 @@ cdef class Decoder:
         self.frames += 1
         cdef int us_copy = int((copy_end - copy_start) * 1000000)
         cdef int us_total = int((copy_end - start) * 1000000)
+        if self.frames <= 3:
+            log.info("mf NV12 UV bytes[0:32]: %s", uv_plane[:32].hex(" "))
         log("mf decoded %8d bytes %dx%d in %dms: input=%dus output=%dus extract=%dus copy=%dus (%.1fMB)",
             src_len, frame.width, frame.height, (us_total + 500) // 1000,
             frame.us_input, frame.us_output, frame.us_extract, us_copy,

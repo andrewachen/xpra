@@ -64,6 +64,13 @@ MARGIN = max(0, min(200, envint("XPRA_SOUND_MARGIN", 50)))
 UNDERRUN_MIN_LEVEL = max(0, envint("XPRA_SOUND_UNDERRUN_MIN_LEVEL", 150))
 CLOCK_SYNC = envbool("XPRA_CLOCK_SYNC", False)
 
+# PLL (phase-locked loop) for dynamic audio buffer sizing:
+PLL_INTERVAL_MS = 200
+PLL_DEAD_BAND_MS = 15
+PLL_GAIN = 0.3
+PLL_MAX_STEP_MS = 30
+PLL_JITTER_HEADROOM_MS = 100
+
 
 def uncompress_data(data: bytes, metadata: dict) -> SizedBuffer:
     if not data or not metadata:
@@ -121,6 +128,8 @@ class AudioSink(AudioPipeline):
         self.last_max_update = monotonic()
         self.last_min_update = monotonic()
         self.level_lock = Lock()
+        self.av_sync_target: int = 0
+        self.pll_timer: int = 0
         pipeline_els = [get_element_str("appsrc", get_default_appsrc_attributes())]
         if parser:
             pipeline_els.append(parser)
@@ -182,6 +191,7 @@ class AudioSink(AudioPipeline):
     def cleanup(self) -> None:
         super().cleanup()
         self.cancel_volume_timer()
+        self.cancel_pll_timer()
         self.sink_type = ""
         self.src = None
 
@@ -201,6 +211,41 @@ class AudioSink(AudioPipeline):
         if self.volume_timer != 0:
             GLib.source_remove(self.volume_timer)
             self.volume_timer = 0
+
+    def cancel_pll_timer(self) -> None:
+        if self.pll_timer != 0:
+            GLib.source_remove(self.pll_timer)
+            self.pll_timer = 0
+
+    def set_av_sync_target(self, target_ms: int) -> None:
+        self.av_sync_target = max(0, target_ms)
+        if self.av_sync_target > 0 and self.pll_timer == 0:
+            self.pll_timer = GLib.timeout_add(PLL_INTERVAL_MS, self._pll_tick)
+        elif self.av_sync_target == 0:
+            self.cancel_pll_timer()
+
+    def _pll_tick(self) -> bool:
+        if not self.queue or self.queue_state == "starting":
+            return True
+        current = self.queue.get_property("min-threshold-time") // MS_TO_NS
+        error = current - self.av_sync_target
+        if abs(error) < PLL_DEAD_BAND_MS:
+            return True
+        correction = max(-PLL_MAX_STEP_MS, min(PLL_MAX_STEP_MS, error * PLL_GAIN))
+        new_min = max(0, min(500, int(current - correction)))
+        if not self.level_lock.acquire(False):
+            return True
+        try:
+            self.queue.set_property("min-threshold-time", new_min * MS_TO_NS)
+            current_max = self.queue.get_property("max-size-time") // MS_TO_NS
+            needed_max = new_min + PLL_JITTER_HEADROOM_MS
+            if needed_max > current_max:
+                self.queue.set_property("max-size-time", needed_max * MS_TO_NS)
+            gstlog("pll_tick: target=%i, current=%i, error=%i, correction=%.1f, new_min=%i",
+                   self.av_sync_target, current, error, correction, new_min)
+        finally:
+            self.level_lock.release()
+        return True
 
     def adjust_volume(self) -> bool:
         if not self.volume:
@@ -279,6 +324,8 @@ class AudioSink(AudioPipeline):
         return True
 
     def set_min_level(self) -> None:
+        if self.av_sync_target > 0:
+            return
         if not self.queue:
             return
         now = monotonic()
@@ -312,6 +359,8 @@ class AudioSink(AudioPipeline):
             self.level_lock.release()
 
     def set_max_level(self) -> None:
+        if self.av_sync_target > 0:
+            return
         if not self.queue:
             return
         now = monotonic()

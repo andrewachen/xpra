@@ -64,12 +64,12 @@ MARGIN = max(0, min(200, envint("XPRA_SOUND_MARGIN", 50)))
 UNDERRUN_MIN_LEVEL = max(0, envint("XPRA_SOUND_UNDERRUN_MIN_LEVEL", 150))
 CLOCK_SYNC = envbool("XPRA_CLOCK_SYNC", False)
 
-# PLL (phase-locked loop) for dynamic audio buffer sizing:
-PLL_INTERVAL_MS = 200
-PLL_DEAD_BAND_MS = 15
-PLL_GAIN = 0.3
-PLL_MAX_STEP_MS = 30
-PLL_JITTER_HEADROOM_MS = 100
+# proportional controller for dynamic audio buffer sizing:
+AV_SYNC_INTERVAL_MS = 200
+AV_SYNC_DEAD_BAND_MS = 15
+AV_SYNC_GAIN = 0.3
+AV_SYNC_MAX_STEP_MS = 30
+AV_SYNC_HEADROOM_MS = 100
 
 
 def uncompress_data(data: bytes, metadata: dict) -> SizedBuffer:
@@ -129,7 +129,7 @@ class AudioSink(AudioPipeline):
         self.last_min_update = monotonic()
         self.level_lock = Lock()
         self.av_sync_target: int = 0
-        self.pll_timer: int = 0
+        self.av_sync_timer: int = 0
         pipeline_els = [get_element_str("appsrc", get_default_appsrc_attributes())]
         if parser:
             pipeline_els.append(parser)
@@ -191,7 +191,7 @@ class AudioSink(AudioPipeline):
     def cleanup(self) -> None:
         super().cleanup()
         self.cancel_volume_timer()
-        self.cancel_pll_timer()
+        self.cancel_av_sync_timer()
         self.sink_type = ""
         self.src = None
 
@@ -212,37 +212,42 @@ class AudioSink(AudioPipeline):
             GLib.source_remove(self.volume_timer)
             self.volume_timer = 0
 
-    def cancel_pll_timer(self) -> None:
-        if self.pll_timer != 0:
-            GLib.source_remove(self.pll_timer)
-            self.pll_timer = 0
+    def cancel_av_sync_timer(self) -> None:
+        if self.av_sync_timer != 0:
+            GLib.source_remove(self.av_sync_timer)
+            self.av_sync_timer = 0
 
     def set_av_sync_target(self, target_ms: int) -> None:
         self.av_sync_target = max(0, target_ms)
-        if self.av_sync_target > 0 and self.pll_timer == 0:
-            self.pll_timer = GLib.timeout_add(PLL_INTERVAL_MS, self._pll_tick)
+        if self.av_sync_target > 0 and self.av_sync_timer == 0:
+            self.av_sync_timer = GLib.timeout_add(AV_SYNC_INTERVAL_MS, self._av_sync_tick)
         elif self.av_sync_target == 0:
-            self.cancel_pll_timer()
+            self.cancel_av_sync_timer()
 
-    def _pll_tick(self) -> bool:
+    def _av_sync_tick(self) -> bool:
         if not self.queue or self.queue_state == "starting":
             return True
-        current = self.queue.get_property("min-threshold-time") // MS_TO_NS
-        error = current - self.av_sync_target
-        if abs(error) < PLL_DEAD_BAND_MS:
+        current_min = self.queue.get_property("min-threshold-time") // MS_TO_NS
+        current_max = self.queue.get_property("max-size-time") // MS_TO_NS
+        target_max = self.av_sync_target + AV_SYNC_HEADROOM_MS
+        error = current_min - self.av_sync_target
+        if abs(error) < AV_SYNC_DEAD_BAND_MS and abs(current_max - target_max) < AV_SYNC_DEAD_BAND_MS:
             return True
-        correction = max(-PLL_MAX_STEP_MS, min(PLL_MAX_STEP_MS, error * PLL_GAIN))
-        new_min = max(0, min(500, int(current - correction)))
+        correction = max(-AV_SYNC_MAX_STEP_MS, min(AV_SYNC_MAX_STEP_MS, error * AV_SYNC_GAIN))
+        new_min = max(0, min(500, int(current_min - correction)))
+        # converge max-size-time toward target + headroom;
+        # reducing it below the current buffer level causes the
+        # downstream-leaky queue to drop oldest audio (skip forward):
+        max_correction = max(-AV_SYNC_MAX_STEP_MS, min(AV_SYNC_MAX_STEP_MS,
+                                                        (current_max - target_max) * AV_SYNC_GAIN))
+        new_max = max(new_min + AV_SYNC_HEADROOM_MS, int(current_max - max_correction))
         if not self.level_lock.acquire(False):
             return True
         try:
             self.queue.set_property("min-threshold-time", new_min * MS_TO_NS)
-            current_max = self.queue.get_property("max-size-time") // MS_TO_NS
-            needed_max = new_min + PLL_JITTER_HEADROOM_MS
-            if needed_max > current_max:
-                self.queue.set_property("max-size-time", needed_max * MS_TO_NS)
-            gstlog("pll_tick: target=%i, current=%i, error=%i, correction=%.1f, new_min=%i",
-                   self.av_sync_target, current, error, correction, new_min)
+            self.queue.set_property("max-size-time", new_max * MS_TO_NS)
+            gstlog("av_sync_tick: target=%i, min=%i→%i, max=%i→%i",
+                   self.av_sync_target, current_min, new_min, current_max, new_max)
         finally:
             self.level_lock.release()
         return True

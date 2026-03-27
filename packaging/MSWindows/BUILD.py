@@ -1312,6 +1312,9 @@ def create_exe(args) -> str:
         if line.startswith("    PostInstall()") and args.light:
             # don't run post-install openssl:
             line = "Log('skipped post-install');"
+        elif line.find("'setup-ssl'") >= 0 and not args.openssl:
+            # skip ssl cert generation when openssl is not bundled:
+            line = "  Log('skipped setup-ssl');\n"
         elif line.find("Xpra Shadow Server") >= 0 and args.light:
             # no shadow server in light builds
             continue

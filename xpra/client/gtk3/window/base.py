@@ -1,4 +1,5 @@
 # This file is part of Xpra.
+# Copyright (C) 2026 Netflix, Inc.
 # Copyright (C) 2011 Serviware (Arthur Huillet, <ahuillet@serviware.com>)
 # Copyright (C) 2010 Antoine Martin <antoine@xpra.org>
 # Copyright (C) 2008 Nathaniel Smith <njs@pobox.com>
@@ -1068,7 +1069,8 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                 if resize:
                     # snap to resize increment grid (ie: terminal character cells)
                     rw, rh = int(resize[0]), int(resize[1])
-                    snapped = snap_to_increment(rw, rh, self.geometry_hints)
+                    snapped_sw, snapped_sh = self.snap_to_server_grid(self.cx(rw), self.cy(rh))
+                    snapped = (self.sx(snapped_sw), self.sy(snapped_sh))
                     if snapped != (rw, rh):
                         # for directions that drag the left or top edge,
                         # adjust position to keep the opposite edge fixed
@@ -1092,6 +1094,21 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         if mrt:
             self.moveresize_timer = 0
             GLib.source_remove(mrt)
+
+    def snap_to_server_grid(self, sw: int, sh: int) -> tuple[int, int]:
+        """snap server-coordinate dimensions to the application's resize increment grid"""
+        sc = self.size_constraints
+        inc = sc.intpair("increment")
+        if not inc:
+            return sw, sh
+        base = sc.intpair("base-size") or (0, 0)
+        snapped = snap_to_increment(sw, sh, {
+            "width_inc": inc[0], "height_inc": inc[1],
+            "base_width": base[0], "base_height": base[1],
+        })
+        if snapped != (sw, sh):
+            geomlog("snap_to_server_grid(%i, %i) inc=%s base=%s -> %s", sw, sh, inc, base, snapped)
+        return snapped
 
     def do_moveresize(self) -> None:
         self.moveresize_timer = 0
@@ -1354,14 +1371,14 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         x, y, w, h = self.get_drawing_area_geometry()
         w = max(1, w)
         h = max(1, h)
-        # snap to grid so the server doesn't send a correction back
-        w, h = snap_to_increment(w, h, self.geometry_hints)
         state = self._window_state
         props = self.get_configure_client_properties()
         self._client_properties = {}
         self._window_state = {}
         self.cancel_window_state_timer()
         sx, sy, sw, sh = self.cx(x), self.cy(y), self.cx(w), self.cy(h)
+        # snap to server grid so the server doesn't send a correction back
+        sw, sh = self.snap_to_server_grid(sw, sh)
         packet: Sequence[PacketElement] = [self.wid, sx, sy, sw, sh, props, self._resize_counter, state, skip_geometry]
         pwid = self.wid
         if self.is_OR():
@@ -1388,7 +1405,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         else:
             self.new_backing(bw, bh)
 
-    def resize(self, w: int, h: int, resize_counter: int = 0) -> None:
+    def resize(self, w: int, h: int, resize_counter: int = 0, force: bool = False) -> None:
         ww, wh = self.get_size()
         geomlog("resize(%s, %s, %s) current size=%s, fullscreen=%s, maximized=%s",
                 w, h, resize_counter, (ww, wh), self._fullscreen, self._maximized)
@@ -1404,7 +1421,16 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                 sc = typedict(force_size_constraint(w, h))
                 self._metadata.update(sc)
                 self.set_metadata(sc)
-            Gtk.Window.resize(self, w, h)
+            if force:
+                # use GDK directly to bypass WM geometry hint enforcement
+                gdkwin = self.get_window()
+                if gdkwin:
+                    geomlog("resize(%i, %i) using GDK (bypass WM hints)", w, h)
+                    gdkwin.resize(w, h)
+                else:
+                    Gtk.Window.resize(self, w, h)
+            else:
+                Gtk.Window.resize(self, w, h)
             ww, wh = w, h
             self._backing.offsets = 0, 0, 0, 0
         else:
@@ -1452,7 +1478,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
                 geomlog("window unchanged")
             else:
                 geomlog("unchanged position %ix%i, using resize(%i, %i)", x, y, w, h)
-                self.resize(w, h, resize_counter)
+                self.resize(w, h, resize_counter, force=True)
             return
         # we have to move:
         if not self.get_realized():

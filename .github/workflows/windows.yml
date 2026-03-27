@@ -1,0 +1,94 @@
+name: Windows
+
+on:
+  push:
+    branches:
+      - '**'
+      - '!master'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: windows-11-arm
+            msystem: CLANGARM64
+          - arch: x64
+            runner: windows-latest
+            msystem: MINGW64
+
+    name: Build ${{ matrix.arch }} installer
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure git safe directory
+        shell: cmd
+        run: git config --global --add safe.directory *
+
+      # Install base MSYS2 and set up the shell wrapper.
+      # update: false — SETUP_ci.sh handles pacman -Syu on cache miss.
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: false
+
+      - name: Get date for cache key
+        id: date
+        shell: bash
+        run: echo "date=$(date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      # Cache the full MSYS2 prefix including installed dependencies.
+      # Keyed by date (1-day TTL) + script hash so it invalidates on changes.
+      # On cache hit, this overwrites the base install from the step above
+      # with the fully-populated prefix (base + all deps).
+      - name: Restore MSYS2 package cache
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}\msys64
+          key: msys2-${{ matrix.msystem }}-${{ steps.date.outputs.date }}-${{ hashFiles('packaging/MSWindows/SETUP_ci.sh') }}
+
+      - name: Install dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          PIP_BREAK_SYSTEM_PACKAGES: "1"
+        run: |
+          for attempt in 1 2 3; do
+            if packaging/MSWindows/SETUP_ci.sh; then
+              exit 0
+            fi
+            echo "::warning::Dependency install attempt $attempt/3 failed, retrying in 15s..."
+            sleep 15
+          done
+          echo "::error::All 3 dependency install attempts failed"
+          exit 1
+
+      - name: Build
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: >-
+          python packaging/MSWindows/BUILD.py
+          --no-light --no-sign --no-sbom --no-msi --no-zip --no-run
+          --no-cuda --no-printing --no-service
+          --no-docs --no-html5
+          --no-putty --no-openssh --no-openssl --no-paexec --no-desktop-logon
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v6
+        with:
+          name: Xpra-${{ matrix.arch }}-installer
+          path: Xpra*Setup*.exe
+          if-no-files-found: error

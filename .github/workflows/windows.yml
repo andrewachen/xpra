@@ -5,6 +5,10 @@ on:
     branches:
       - '**'
       - '!master'
+  # Daily cache warm on the default branch (v6.4.3-achen).
+  # All other branches fall back to the default branch's cache on miss.
+  schedule:
+    - cron: '0 0 * * *'  # midnight UTC
   workflow_dispatch:
 
 jobs:

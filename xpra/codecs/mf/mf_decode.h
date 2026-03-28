@@ -26,11 +26,9 @@ typedef enum {
 
 typedef struct {
     uint8_t *y_data;
-    uint8_t *u_data;       /* de-interleaved U plane (YUV420P) */
-    uint8_t *v_data;       /* de-interleaved V plane (YUV420P) */
+    uint8_t *uv_data;      /* NV12 interleaved UV plane */
     int      y_stride;
-    int      u_stride;
-    int      v_stride;
+    int      uv_stride;
     int      width;
     int      height;
     int      full_range;
@@ -38,7 +36,6 @@ typedef struct {
     int      us_input;      /* ProcessInput */
     int      us_output;     /* ProcessOutput (includes GPU decode + sync) */
     int      us_extract;    /* ConvertToContiguousBuffer + Lock (GPU→CPU copy) */
-    int      us_split;      /* UV de-interleave (NV12 → YUV420P) */
 } MFDecodedFrame;
 
 /* Global init / shutdown (call once per process) */

@@ -2886,14 +2886,8 @@ if amf_ENABLED:
     tace(WIN32, "xpra.platform.win32.d3d11.device")
 toggle_packages(mf_decoder_ENABLED, "xpra.codecs.mf")
 if mf_decoder_ENABLED:
-    mf_link_args = ["-lmfplat", "-lmfuuid", "-lole32", "-ld3d11", "-ldxguid"]
-    mf_compile_args = []
-    if csc_libyuv_ENABLED:
-        mf_link_args.append("-lyuv")
-        mf_compile_args.append("-DHAVE_LIBYUV")
     ace("xpra.codecs.mf.decoder,xpra/codecs/mf/mf_decode.c",
-        extra_link_args=tuple(mf_link_args),
-        extra_compile_args=tuple(mf_compile_args))
+        extra_link_args=("-lmfplat", "-lmfuuid", "-lole32", "-ld3d11", "-ldxguid"))
 toggle_packages(gstreamer_ENABLED, "xpra.gstreamer")
 toggle_packages(gstreamer_video_ENABLED, "xpra.codecs.gstreamer")
 toggle_packages(remote_encoder_ENABLED, "xpra.codecs.remote")

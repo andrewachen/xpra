@@ -22,7 +22,8 @@ def GLArea(alpha: bool) -> Gtk.GLArea:
     glarea = Gtk.GLArea()
     glarea.set_use_es(True)
     glarea.set_auto_render(False)
-    glarea.set_has_alpha(alpha)
+    # Always include alpha in the readback so the surface gets alpha=255
+    glarea.set_has_alpha(True)
     glarea.set_has_depth_buffer(False)
     glarea.set_has_stencil_buffer(False)
     glarea.set_required_version(3, 2)

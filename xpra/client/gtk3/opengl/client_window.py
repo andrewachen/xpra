@@ -100,7 +100,10 @@ class GLClientWindowBase(ClientWindow):
         widget = super().new_backing(bw, bh)
         if self.drawing_area:
             self.remove(self.drawing_area)
-        set_visual(widget, self._has_alpha)
+        # Always use RGBA visual so the window's GDI surface has a proper
+        # alpha channel. Without this, composited GL content leaves the surface
+        # alpha undefined, which Intel DWM reads as transparent.
+        set_visual(widget, True)
         widget.show()
         self.init_widget_events(widget)
         if self.drawing_area and self.size_constraints:

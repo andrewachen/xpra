@@ -405,7 +405,7 @@ class GLWindowBackingBase(WindowBackingBase):
         if self._alpha_enabled:
             glClearColor(0, 0, 0, 1)
         else:
-            glClearColor(1, 1, 1, 0)
+            glClearColor(1, 1, 1, 1)
         glClear(GL_COLOR_BUFFER_BIT)
         # copy offscreen to new tmp:
         self.copy_fbo(w, h, sx, sy, dx, dy)
@@ -617,7 +617,7 @@ class GLWindowBackingBase(WindowBackingBase):
         if self._alpha_enabled:
             glClearColor(0, 0, 0, 1)
         else:
-            glClearColor(1, 1, 1, 0)
+            glClearColor(1, 1, 1, 1)
         glClear(GL_COLOR_BUFFER_BIT)
 
     def close_gl_config(self) -> None:
@@ -780,7 +780,7 @@ class GLWindowBackingBase(WindowBackingBase):
         if self._alpha_enabled:
             glClearColor(0, 0, 0, 1)
         else:
-            glClearColor(1, 1, 1, 0)
+            glClearColor(1, 1, 1, 1)
         glClear(GL_COLOR_BUFFER_BIT)
 
         glBlitFramebuffer(sx, sy, sx + w, sy + h,

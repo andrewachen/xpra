@@ -96,16 +96,24 @@ WINDOW_OVERFLOW_TOP = envbool("XPRA_WINDOW_OVERFLOW_TOP", False)
 AWT_RECENTER = envbool("XPRA_AWT_RECENTER", True)
 
 
-def snap_to_increment(w: int, h: int, hints: dict) -> tuple[int, int]:
+def snap_to_increment(w: int, h: int, hints: dict, nearest: bool = False) -> tuple[int, int]:
     """snap dimensions to the resize increment grid: base + increment * N"""
     inc_w = hints.get("width_inc", 0)
     inc_h = hints.get("height_inc", 0)
     base_w = hints.get("base_width", 0)
     base_h = hints.get("base_height", 0)
     if inc_w > 1:
-        w -= max(w - base_w, 0) % inc_w
+        ew = max(w - base_w, 0)
+        if nearest:
+            w = base_w + ((ew + inc_w // 2) // inc_w) * inc_w
+        else:
+            w -= ew % inc_w
     if inc_h > 1:
-        h -= max(h - base_h, 0) % inc_h
+        eh = max(h - base_h, 0)
+        if nearest:
+            h = base_h + ((eh + inc_h // 2) // inc_h) * inc_h
+        else:
+            h -= eh % inc_h
     return w, h
 
 
@@ -184,6 +192,8 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         self.show_pointer_overlay_timer: int = 0
         self.moveresize_timer: int = 0
         self.moveresize_event = None
+        self.increment_snap_timer: int = 0
+        self.increment_snap_target: tuple[int, int, int, int] | None = None
         # only set this initially:
         # (so the server can't make us kill just any pid!)
         watcher_pid = metadata.intget("watcher-pid", 0)
@@ -1095,7 +1105,31 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
             self.moveresize_timer = 0
             GLib.source_remove(mrt)
 
-    def snap_to_server_grid(self, sw: int, sh: int) -> tuple[int, int]:
+    def cancel_increment_snap_timer(self) -> None:
+        ist = self.increment_snap_timer
+        if ist:
+            self.increment_snap_timer = 0
+            GLib.source_remove(ist)
+
+    def do_increment_snap(self) -> None:
+        self.increment_snap_timer = 0
+        target = self.increment_snap_target
+        if not target:
+            return
+        recorded_w, recorded_h, snapped_w, snapped_h = target
+        current_w, current_h = self.get_size()
+        if (current_w, current_h) != (recorded_w, recorded_h):
+            # stale — window was resized since we scheduled, ignore
+            geomlog("do_increment_snap: stale, current=%s recorded=%s",
+                    (current_w, current_h), (recorded_w, recorded_h))
+            return
+        self.increment_snap_target = None
+        gdkwin = self.get_window()
+        if gdkwin:
+            geomlog("do_increment_snap: resizing to %ix%i", snapped_w, snapped_h)
+            gdkwin.resize(snapped_w, snapped_h)
+
+    def snap_to_server_grid(self, sw: int, sh: int, nearest: bool = False) -> tuple[int, int]:
         """snap server-coordinate dimensions to the application's resize increment grid"""
         sc = self.size_constraints
         inc = sc.intpair("increment")
@@ -1105,9 +1139,10 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         snapped = snap_to_increment(sw, sh, {
             "width_inc": inc[0], "height_inc": inc[1],
             "base_width": base[0], "base_height": base[1],
-        })
+        }, nearest=nearest)
         if snapped != (sw, sh):
-            geomlog("snap_to_server_grid(%i, %i) inc=%s base=%s -> %s", sw, sh, inc, base, snapped)
+            geomlog("snap_to_server_grid(%i, %i) inc=%s base=%s nearest=%s -> %s",
+                    sw, sh, inc, base, nearest, snapped)
         return snapped
 
     def do_moveresize(self) -> None:
@@ -1358,6 +1393,17 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         self._size = (w, h)
         self._set_backing_size(w, h)
         self.send_configure_event(skip_geometry)
+        # schedule client window snap if the size is off the server grid
+        inc = self.size_constraints.intpair("increment")
+        if inc:
+            snapped_sw, snapped_sh = self.snap_to_server_grid(self.cx(w), self.cy(h), nearest=True)
+            snapped_w, snapped_h = self.sx(snapped_sw), self.sy(snapped_sh)
+            if (snapped_w, snapped_h) != (w, h):
+                self.increment_snap_target = (w, h, snapped_w, snapped_h)
+                if not self.increment_snap_timer:
+                    self.increment_snap_timer = GLib.timeout_add(50, self.do_increment_snap)
+            else:
+                self.increment_snap_target = None
         if self._backing and not self._iconified:
             geomlog("configure event: queueing redraw")
             self.repaint(0, 0, w, h)
@@ -1377,8 +1423,9 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         self._window_state = {}
         self.cancel_window_state_timer()
         sx, sy, sw, sh = self.cx(x), self.cy(y), self.cx(w), self.cy(h)
-        # snap to server grid so the server doesn't send a correction back
-        sw, sh = self.snap_to_server_grid(sw, sh)
+        # snap to server grid so the server doesn't send a correction back;
+        # nearest rounding keeps the cx→snap→sx round-trip stable at any scale
+        sw, sh = self.snap_to_server_grid(sw, sh, nearest=True)
         packet: Sequence[PacketElement] = [self.wid, sx, sy, sw, sh, props, self._resize_counter, state, skip_geometry]
         pwid = self.wid
         if self.is_OR():
@@ -1511,6 +1558,7 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         self.cancel_window_state_timer()
         self.cancel_send_iconifiy_timer()
         self.cancel_moveresize_timer()
+        self.cancel_increment_snap_timer()
         self.cancel_follow_handler()
         self.on_realize_cb = {}
 

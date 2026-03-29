@@ -38,7 +38,7 @@ from OpenGL.GL import (
     glBindBuffer, glGenBuffers, glBufferData, glDeleteBuffers,
     glTexParameteri,
     glTexImage2D,
-    glClear, glClearColor,
+    glClear, glClearColor, glColorMask,
     glDrawBuffer, glReadBuffer,
     GL_FLOAT, GL_ARRAY_BUFFER,
     GL_STATIC_DRAW, GL_FALSE,
@@ -920,6 +920,15 @@ class GLWindowBackingBase(WindowBackingBase):
 
         if self.is_show_fps():
             self.draw_fps()
+
+        # Force alpha=1 in the presented surface for non-alpha windows.
+        # Intel GPUs return pixel formats with alpha bits even when none are
+        # requested, and DWM reads undefined alpha as transparent.
+        if not self._alpha_enabled:
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE)
+            glClearColor(0, 0, 0, 1)
+            glClear(GL_COLOR_BUFFER_BIT)
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE)
 
         # Show the backbuffer on screen
         glFlush()

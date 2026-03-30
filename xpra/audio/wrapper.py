@@ -149,7 +149,7 @@ class AudioPlay(AudioSubprocess):
     def __init__(self, *pipeline_args):
         from xpra.audio.sink import AudioSink
         audio_pipeline = AudioSink(*pipeline_args)
-        super().__init__(audio_pipeline, ["add_data"], [])
+        super().__init__(audio_pipeline, ["add_data", "set_av_sync_target"], [])
 
 
 def run_audio(mode: str, error_cb: Callable, args: list[str]) -> int:
@@ -371,6 +371,9 @@ class SinkSubprocessWrapper(AudioSubprocessWrapper):
         if DEBUG_SOUND:
             log("add_data(%s bytes, %s, %s) forwarding to %s", len(data), metadata, len(packet_metadata), self.protocol)
         self.send("add_data", data, metadata, packet_metadata)
+
+    def set_av_sync_target(self, target_ms: int) -> None:
+        self.send("set_av_sync_target", target_ms)
 
     def __repr__(self):
         proc = self.process

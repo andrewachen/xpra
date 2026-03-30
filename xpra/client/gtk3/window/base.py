@@ -192,8 +192,6 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         self.show_pointer_overlay_timer: int = 0
         self.moveresize_timer: int = 0
         self.moveresize_event = None
-        self.increment_snap_timer: int = 0
-        self.increment_snap_target: tuple[int, int, int, int] | None = None
         # only set this initially:
         # (so the server can't make us kill just any pid!)
         watcher_pid = metadata.intget("watcher-pid", 0)
@@ -1105,32 +1103,6 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
             self.moveresize_timer = 0
             GLib.source_remove(mrt)
 
-    def cancel_increment_snap_timer(self) -> None:
-        ist = self.increment_snap_timer
-        if ist:
-            self.increment_snap_timer = 0
-            GLib.source_remove(ist)
-
-    def do_increment_snap(self) -> None:
-        self.increment_snap_timer = 0
-        if self._fullscreen or self._maximized:
-            return
-        target = self.increment_snap_target
-        if not target:
-            return
-        recorded_w, recorded_h, snapped_w, snapped_h = target
-        current_w, current_h = self.get_size()
-        if (current_w, current_h) != (recorded_w, recorded_h):
-            # stale — window was resized since we scheduled, ignore
-            geomlog("do_increment_snap: stale, current=%s recorded=%s",
-                    (current_w, current_h), (recorded_w, recorded_h))
-            return
-        self.increment_snap_target = None
-        gdkwin = self.get_window()
-        if gdkwin:
-            geomlog("do_increment_snap: resizing to %ix%i", snapped_w, snapped_h)
-            gdkwin.resize(snapped_w, snapped_h)
-
     def snap_to_server_grid(self, sw: int, sh: int, nearest: bool = False) -> tuple[int, int]:
         """snap server-coordinate dimensions to the application's resize increment grid"""
         sc = self.size_constraints
@@ -1395,19 +1367,6 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         self._size = (w, h)
         self._set_backing_size(w, h)
         self.send_configure_event(skip_geometry)
-        # schedule client window snap if the size is off the server grid
-        # (skip for maximized/fullscreen — the small border is expected)
-        if not self._fullscreen and not self._maximized:
-            inc = self.size_constraints.intpair("increment")
-            if inc:
-                snapped_sw, snapped_sh = self.snap_to_server_grid(self.cx(w), self.cy(h), nearest=True)
-                snapped_w, snapped_h = self.sx(snapped_sw), self.sy(snapped_sh)
-                if (snapped_w, snapped_h) != (w, h):
-                    self.increment_snap_target = (w, h, snapped_w, snapped_h)
-                    if not self.increment_snap_timer:
-                        self.increment_snap_timer = GLib.timeout_add(50, self.do_increment_snap)
-                else:
-                    self.increment_snap_target = None
         if self._backing and not self._iconified:
             geomlog("configure event: queueing redraw")
             self.repaint(0, 0, w, h)
@@ -1564,7 +1523,6 @@ class GTKClientWindowBase(ClientWindowBase, Gtk.Window):
         self.cancel_window_state_timer()
         self.cancel_send_iconifiy_timer()
         self.cancel_moveresize_timer()
-        self.cancel_increment_snap_timer()
         self.cancel_follow_handler()
         self.on_realize_cb = {}
 

@@ -559,7 +559,7 @@ class WindowClient(StubClientMixin):
                    (device_id, wid, button, distance, pointer, props), self.server_precise_wheel, modifiers, pointer)
         if self.server_precise_wheel:
             # send the exact value multiplied by 1000 (as an int)
-            idist = round(distance * 1000)
+            idist = round(distance * 1000 * MOUSE_SCROLL_MULTIPLIER / 100)
             if abs(idist) > 0:
                 packet = ["wheel-motion", wid,
                           button, idist,

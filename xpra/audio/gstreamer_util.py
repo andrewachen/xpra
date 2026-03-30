@@ -470,8 +470,8 @@ def get_sink_plugins() -> list[str]:
         SINKS.append("osxaudiosink")
     elif WIN32:
         SINKS.append("wasapi2sink")
-        SINKS.append("directsoundsink")
         SINKS.append("wasapisink")
+        SINKS.append("directsoundsink")
     SINKS.append("autoaudiosink")
     if POSIX and not OSX:
         try:

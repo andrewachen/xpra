@@ -31,6 +31,8 @@ QUERY_SLEEP = envint("XPRA_AUDIO_QUERY_SLEEP", 0)
 AV_SYNC_DELTA = envint("XPRA_AV_SYNC_DELTA")
 DELTA_THRESHOLD = envint("XPRA_AV_SYNC_DELTA_THRESHOLD", 40)
 DEFAULT_AV_SYNC_DELAY = envint("XPRA_DEFAULT_AV_SYNC_DELAY", 150)
+# estimated constant latency of the local audio output pipeline (Opus decode + output sink):
+AUDIO_PIPELINE_LATENCY_MS = 25
 
 
 def init_audio_tagging(icon: str) -> None:
@@ -115,6 +117,7 @@ class AudioClient(StubClientMixin):
         self.server_audio_receive: bool = False
         self.server_audio_send: bool = False
         self.queue_used_sent: int = 0
+        self._av_sync_timer: int = 0
         self.wants_audio_capabilities = False            # flag indicating that the server wants 'audio-capabilities'
         # duplicated from ServerInfo mixin:
         self._remote_machine_id = ""
@@ -505,6 +508,9 @@ class AudioClient(StubClientMixin):
             and toggle the flag so that we ignore further packets
             and emit the `new-sequence` client signal
         """
+        if self._av_sync_timer:
+            GLib.source_remove(self._av_sync_timer)
+            self._av_sync_timer = 0
         ss = self.audio_sink
         log("stop_receiving_audio(%s) audio sink=%s", tell_server, ss)
         if self.speaker_enabled:
@@ -529,7 +535,32 @@ class AudioClient(StubClientMixin):
         if state == "ready":
             self.on_sink_ready()
             self.on_sink_ready = noop
+            if self._av_sync_timer == 0:
+                self._av_sync_timer = GLib.timeout_add(200, self._update_av_sync_target)
         self.emit("speaker-changed")
+
+    def _update_av_sync_target(self) -> bool:
+        ss = self.audio_sink
+        if not ss:
+            self._av_sync_timer = 0
+            return False
+        mean_ms, stddev_ms = self.get_video_decode_stats()
+        if mean_ms == 0:
+            return True
+        # RTT gate: fall back to static buffer on high-latency connections
+        rtt_ms = 0.0
+        if hasattr(self, "server_ping_latency") and self.server_ping_latency:
+            rtt_ms = self.server_ping_latency[-1][1] * 1000.0
+        if rtt_ms > 50:
+            avsynclog("av-sync: RTT %.1fms > 50ms, keeping static buffer", rtt_ms)
+            return True
+        jitter_floor = max(stddev_ms + 20, 20)
+        target = max(mean_ms - AUDIO_PIPELINE_LATENCY_MS, jitter_floor)
+        target = max(20, min(500, int(target)))
+        avsynclog("av-sync target: mean=%.1fms, stddev=%.1fms, rtt=%.1fms, target=%ims",
+                  mean_ms, stddev_ms, rtt_ms, target)
+        ss.set_av_sync_target(target)
+        return True
 
     def audio_sink_bitrate_changed(self, audio_sink, bitrate: int) -> None:
         if audio_sink != self.audio_sink:

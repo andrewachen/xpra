@@ -5,6 +5,7 @@
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
+import math
 from collections import deque
 from time import sleep, monotonic
 from queue import SimpleQueue
@@ -43,6 +44,15 @@ class WindowDraw(StubClientMixin):
         self._draw_thread: Thread | None = None
         self._draw_counter: int = 0
         self.pixel_counter: deque = deque(maxlen=1000)
+        self.video_decode_times: deque[float] = deque(maxlen=100)
+
+    def get_video_decode_stats(self) -> tuple[float, float]:
+        samples = tuple(self.video_decode_times)
+        if len(samples) < 20:
+            return 0.0, 0.0
+        mean = sum(samples) / len(samples)
+        variance = sum((s - mean) ** 2 for s in samples) / len(samples)
+        return mean, math.sqrt(variance)
 
     def run(self) -> ExitValue:
         # we decode pixel data in this thread
@@ -155,6 +165,7 @@ class WindowDraw(StubClientMixin):
                 end = monotonic()
                 decode_time = round(end * 1000 * 1000 - start * 1000 * 1000)
                 self.pixel_counter.append((start, end, width * height))
+                self.video_decode_times.append(decode_time / 1000.0)  # µs → ms
                 dms = "%sms" % (int(decode_time / 100) / 10.0)
                 paintlog("record_decode_time(%s, %s) wid=%#x, %s: %sx%s, %s",
                          success, message, wid, coding, width, height, dms)

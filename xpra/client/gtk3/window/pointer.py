@@ -289,6 +289,13 @@ class PointerWindow(GtkStubWindow):
             norm_x = norm_scroll(event.delta_x)
             norm_y = norm_scroll(event.delta_y)
             self._client.wheel_event(device_id, self.wid, norm_x, -norm_y, pointer)
+            # GDK on Win32 emits both a SMOOTH and a discrete event per scroll notch,
+            # record the event time so we can skip the redundant discrete duplicate:
+            self._smooth_scroll_event_time = event.time
+            return True
+        if getattr(self, "_smooth_scroll_event_time", 0) == event.time:
+            self._smooth_scroll_event_time = 0
+            log("skipping duplicate discrete scroll event for smooth at time=%s", event.time)
             return True
         button_mapping = GDK_SCROLL_MAP.get(event.direction, -1)
         log("do_scroll_event device=%s, direction=%s, button_mapping=%s",

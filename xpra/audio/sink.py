@@ -254,12 +254,15 @@ class AudioSink(AudioPipeline):
         target_max = self.av_sync_target + AV_SYNC_HEADROOM_MS
         if abs(current_max - target_max) < AV_SYNC_DEAD_BAND_MS:
             return True
-        # converge max-size-time toward target + headroom;
-        # reducing it below the current buffer level causes the
-        # downstream-leaky queue to drop oldest audio (skip forward):
-        max_correction = max(-AV_SYNC_MAX_STEP_MS, min(AV_SYNC_MAX_STEP_MS,
-                                                        (current_max - target_max) * AV_SYNC_GAIN))
-        new_max = max(AV_SYNC_HEADROOM_MS, int(current_max - max_correction))
+        # asymmetric convergence:
+        # grow immediately — downstream leak protects against overruns;
+        # shrink slowly via proportional controller to avoid oscillation:
+        if current_max < target_max:
+            new_max = target_max
+        else:
+            max_correction = max(-AV_SYNC_MAX_STEP_MS, min(AV_SYNC_MAX_STEP_MS,
+                                                            (current_max - target_max) * AV_SYNC_GAIN))
+            new_max = max(AV_SYNC_HEADROOM_MS, int(current_max - max_correction))
         if not self.level_lock.acquire(False):
             return True
         try:

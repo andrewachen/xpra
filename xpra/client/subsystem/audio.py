@@ -3,7 +3,9 @@
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
+from time import monotonic
 from typing import Any
+from collections import deque
 from collections.abc import Callable, Sequence, Iterable
 
 from xpra.audio.common import AUDIO_DATA_PACKET, AUDIO_CONTROL_PACKET
@@ -30,6 +32,12 @@ DELTA_THRESHOLD = envint("XPRA_AV_SYNC_DELTA_THRESHOLD", 40)
 DEFAULT_AV_SYNC_DELAY = envint("XPRA_DEFAULT_AV_SYNC_DELAY", 150)
 # estimated constant latency of the local audio output pipeline (Opus decode + PulseAudio):
 AUDIO_PIPELINE_LATENCY_MS = 25
+
+# adaptive jitter buffer sizing (NetEQ-inspired sliding window percentile):
+JITTER_MIN_SAMPLES = 16        # ~320ms at 20ms Opus frames before adaptive kicks in
+MAX_JITTER_BUFFER = 500        # cap jitter buffer at 500ms
+JITTER_PERCENTILE = 0.95       # target 95th percentile of delay variation
+PEAK_HOLD_SECONDS = 5          # how long peak detection stays active after a spike
 
 
 def init_audio_tagging(tray_icon) -> None:
@@ -99,6 +107,12 @@ class AudioClient(StubClientMixin):
         self.server_audio_send: bool = False
         self.queue_used_sent: int = 0
         self._av_sync_timer: int = 0
+        # jitter estimation state (sliding window of transit time variations):
+        self._last_audio_arrival: float = 0.0
+        self._last_audio_server_time: int = 0
+        self._delay_window: deque[float] = deque(maxlen=100)
+        self._delay_peaks: deque[tuple[float, float]] = deque(maxlen=8)
+        self._cached_p95: float = 0.0
         # duplicated from ServerInfo mixin:
         self._remote_machine_id = ""
 
@@ -201,6 +215,16 @@ class AudioClient(StubClientMixin):
         ss = self.audio_sink
         if ss:
             info["sink"] = ss.get_info()
+        delays = self._delay_window
+        if delays:
+            sorted_delays = sorted(delays)
+            p95_idx = int(JITTER_PERCENTILE * len(delays))
+            info["jitter"] = {
+                "p95": round(sorted_delays[min(p95_idx, len(sorted_delays) - 1)], 1),
+                "max": round(sorted_delays[-1], 1),
+                "samples": len(delays),
+                "peaks": len([1 for t, _ in self._delay_peaks if monotonic() - t < PEAK_HOLD_SECONDS]),
+            }
         return {AudioClient.PREFIX: info}
 
     def get_caps(self) -> dict[str, Any]:
@@ -455,6 +479,11 @@ class AudioClient(StubClientMixin):
         if self._av_sync_timer:
             GLib.source_remove(self._av_sync_timer)
             self._av_sync_timer = 0
+        self._last_audio_arrival = 0.0
+        self._last_audio_server_time = 0
+        self._delay_window.clear()
+        self._delay_peaks.clear()
+        self._cached_p95 = 0.0
         ss = self.audio_sink
         log("stop_receiving_audio(%s) audio sink=%s", tell_server, ss)
         if self.speaker_enabled:
@@ -488,21 +517,34 @@ class AudioClient(StubClientMixin):
         if not ss:
             self._av_sync_timer = 0
             return False
+        # video decode component (for AV sync on LAN):
         mean_ms, stddev_ms = self.get_video_decode_stats()
-        if mean_ms == 0:
+        if mean_ms > 0:
+            av_component = max(mean_ms - AUDIO_PIPELINE_LATENCY_MS, stddev_ms + 10, 0)
+        else:
+            av_component = 0
+        # network jitter component (95th percentile of transit time variation):
+        delays = self._delay_window
+        if len(delays) >= JITTER_MIN_SAMPLES:
+            p95 = sorted(delays)[int(JITTER_PERCENTILE * len(delays))]
+            self._cached_p95 = p95
+            jitter_component = min(p95, MAX_JITTER_BUFFER)
+            # if a recent peak exceeds p95, hold the buffer at peak level:
+            now = monotonic()
+            active_peaks = [amp for t, amp in self._delay_peaks if now - t < PEAK_HOLD_SECONDS]
+            if active_peaks:
+                jitter_component = max(jitter_component, min(max(active_peaks), MAX_JITTER_BUFFER))
+        else:
+            p95 = 0.0
+            jitter_component = 0
+        # need at least one valid component:
+        if av_component == 0 and jitter_component == 0:
             return True
-        # RTT gate: fall back to static buffer on high-latency connections
-        rtt_ms = 0.0
-        if hasattr(self, "server_ping_latency") and self.server_ping_latency:
-            rtt_ms = self.server_ping_latency[-1][1] * 1000.0
-        if rtt_ms > 50:
-            avsynclog("av-sync: RTT %.1fms > 50ms, keeping static buffer", rtt_ms)
-            return True
-        jitter_floor = max(stddev_ms + 20, 20)
-        target = max(mean_ms - AUDIO_PIPELINE_LATENCY_MS, jitter_floor)
+        target = max(av_component, jitter_component)
         target = max(20, min(500, int(target)))
-        avsynclog("av-sync target: mean=%.1fms, stddev=%.1fms, rtt=%.1fms, target=%ims",
-                  mean_ms, stddev_ms, rtt_ms, target)
+        avsynclog("av-sync target: mean=%.1fms, stddev=%.1fms, p95=%.1fms, "
+                  "av=%i, jitter=%i, target=%ims",
+                  mean_ms, stddev_ms, p95, av_component, jitter_component, target)
         ss.set_av_sync_target(target)
         return True
 
@@ -660,6 +702,21 @@ class AudioClient(StubClientMixin):
         # (some packets (ie: sos, eos) only contain metadata)
         if data or packet_metadata:
             ss.add_data(data, dict(metadata), packet_metadata)
+        # measure transit time variation for adaptive jitter buffer:
+        server_time = metadata.intget("time", 0)
+        if server_time > 0:
+            client_now = monotonic()
+            if self._last_audio_arrival > 0 and self._last_audio_server_time > 0:
+                arrival_diff = (client_now - self._last_audio_arrival) * 1000
+                send_diff = server_time - self._last_audio_server_time
+                D = max(0.0, arrival_diff - send_diff)
+                self._delay_window.append(D)
+                # record peaks immediately — checking only on the 200ms timer
+                # would miss spikes between ticks:
+                if D > 2 * max(self._cached_p95, 10):
+                    self._delay_peaks.append((client_now, D))
+            self._last_audio_arrival = client_now
+            self._last_audio_server_time = server_time
         if self.av_sync and self.server_av_sync:
             qinfo = typedict(ss.get_info()).dictget("queue")
             queue_used = typedict(qinfo or {}).intget("cur", -1)

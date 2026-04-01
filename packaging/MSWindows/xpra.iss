@@ -14,6 +14,7 @@ OutputBaseFilename=Xpra_Setup
 ;Compression=none
 ;Compression=lzma2/fast
 Compression=lzma2/max
+LZMANumBlockThreads=4
 SolidCompression=yes
 AllowUNCPath=false
 VersionInfoVersion=6.4.4
@@ -25,6 +26,7 @@ LicenseFile=COPYING
 UninstallDisplayIcon={app}\Xpra-Launcher.exe
 ArchitecturesInstallIn64BitMode=x64compatible
 ArchitecturesAllowed=win64
+DisableFinishedPage=yes
 ;UsePreviousAppDir=false
 
 [Dirs]

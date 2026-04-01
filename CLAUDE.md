@@ -19,6 +19,11 @@ directly with NO blank line between them:
 `Sponsored-By` is for commits and PR descriptions only — NOT for issue/PR
 comments.
 
+## PR descriptions
+
+Do NOT include a "Test plan" section in PR descriptions. The maintainer runs
+their own test suite and does not need a checklist from us.
+
 ## Copyright
 
 Every new file MUST have the standard Xpra copyright header at the very top,

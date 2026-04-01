@@ -1,0 +1,46 @@
+# This file is part of Xpra.
+# Copyright (C) 2026 Netflix, Inc.
+# Xpra is released under the terms of the GNU GPL v2, or, at your option, any
+# later version. See the file COPYING for details.
+# ABOUTME: Ubuntu 24.04 image for building xpra nvenc Cython modules.
+# ABOUTME: Downloads nvEncodeAPI.h from FFmpeg/nv-codec-headers and stubs libnvidia-encode.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Build dependencies: Python, Cython, and xpra's native codec build chain.
+RUN apt-get update && apt-get -y install --no-install-recommends \
+    build-essential \
+    python3-dev \
+    python3-pip \
+    pkg-config \
+    curl \
+    libx11-dev libxtst-dev libxcomposite-dev libxdamage-dev libxpresent-dev libxres-dev \
+    libxkbfile-dev libgtk-3-dev python3-cairo-dev python-gi-dev \
+    libturbojpeg-dev libwebp-dev libx264-dev libvpx-dev libyuv-dev libavif-dev \
+    libopenh264-dev libaom-dev \
+    liblz4-dev libbrotli-dev libxxhash-dev libqrencode-dev \
+    libpam-dev libsystemd-dev \
+    pandoc \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install cython --break-system-packages
+
+# Download nvEncodeAPI.h (SDK 13) from FFmpeg/nv-codec-headers.
+RUN mkdir -p /opt/nvenc/Interface && \
+    curl -sL "https://raw.githubusercontent.com/FFmpeg/nv-codec-headers/master/include/ffnvcodec/nvEncodeAPI.h" \
+        -o /opt/nvenc/Interface/nvEncodeAPI.h
+
+# Create a stub libnvidia-encode.so so the linker is happy.
+# At runtime the real driver library is loaded dynamically via ctypes.
+RUN mkdir -p /usr/lib/x86_64-linux-gnu && \
+    echo 'void NvEncodeAPICreateInstance(void){} void NvEncodeAPIGetMaxSupportedVersion(void){}' | \
+    gcc -shared -x c - -o /usr/lib/x86_64-linux-gnu/libnvidia-encode.so
+
+# Install pkg-config file for nvenc.
+RUN mkdir -p /usr/lib/x86_64-linux-gnu/pkgconfig && \
+    printf 'prefix=/opt/nvenc\nexec_prefix=${prefix}\nincludedir=${prefix}/Interface\nlibdir=/usr/lib/x86_64-linux-gnu\n\nName: nvenc\nDescription: NVENC\nVersion: 13\nLibs: -L${libdir} -lnvidia-encode\nCflags: -I${includedir}\n' \
+    > /usr/lib/x86_64-linux-gnu/pkgconfig/nvenc.pc
+
+WORKDIR /xpra

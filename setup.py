@@ -1924,7 +1924,7 @@ if WIN32:
             ):
                 add_DLLs(f"gst{p}")
             # DLLs needed by the plugins:
-            add_DLLs("faac", "faad", "flac", "mpg123")      #"mad" is no longer included?
+            add_DLLs("faac", "faad", "flac", "mpg123", "soundtouchdll", "sonic")    #"mad" is no longer included?
             # add the gstreamer plugins we need:
             GST_PLUGINS = (
                 "app",

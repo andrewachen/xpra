@@ -227,19 +227,21 @@ class AudioSink(AudioPipeline):
             self.av_sync_timer = 0
 
     def set_av_sync_target(self, target_ms: int) -> None:
-        first_target = self.av_sync_target == 0
+        prev_target = self.av_sync_target
         self.av_sync_target = max(0, target_ms)
         if self.av_sync_target > 0:
-            if first_target and self.queue and self.level_lock.acquire(False):
-                # jump directly to target on first call instead of
-                # slowly converging from the initial 450ms;
-                # also reset min-threshold-time which may have been
-                # raised by underrun recovery during cold start:
+            # jump buffer immediately on first target or significant increase
+            # (waiting for the next tick adds up to 200ms delay):
+            first_target = prev_target == 0
+            significant_increase = self.av_sync_target > prev_target + AV_SYNC_MAX_STEP_MS
+            if (first_target or significant_increase) and self.queue and self.level_lock.acquire(False):
                 try:
-                    self.queue.set_property("min-threshold-time", 0)
+                    if first_target:
+                        self.queue.set_property("min-threshold-time", 0)
                     target_max = self.av_sync_target + AV_SYNC_HEADROOM_MS
                     self.queue.set_property("max-size-time", target_max * MS_TO_NS)
-                    gstlog("av_sync: initial min=0, max-size-time=%i (target=%i)", target_max, self.av_sync_target)
+                    gstlog("av_sync: jump max-size-time=%i (target=%i, prev=%i)",
+                           target_max, self.av_sync_target, prev_target)
                 finally:
                     self.level_lock.release()
             if self.av_sync_timer == 0:
@@ -252,25 +254,22 @@ class AudioSink(AudioPipeline):
             return True
         current_max = self.queue.get_property("max-size-time") // MS_TO_NS
         target_max = self.av_sync_target + AV_SYNC_HEADROOM_MS
-        if abs(current_max - target_max) < AV_SYNC_DEAD_BAND_MS:
-            return True
-        # asymmetric convergence:
-        # grow immediately — downstream leak protects against overruns;
-        # shrink slowly via proportional controller to avoid oscillation:
+        # asymmetric: always grow (no dead band), only shrink past dead band:
         if current_max < target_max:
             new_max = target_max
-        else:
+        elif current_max - target_max >= AV_SYNC_DEAD_BAND_MS:
             max_correction = max(-AV_SYNC_MAX_STEP_MS, min(AV_SYNC_MAX_STEP_MS,
                                                             (current_max - target_max) * AV_SYNC_GAIN))
             new_max = max(AV_SYNC_HEADROOM_MS, int(current_max - max_correction))
-        if not self.level_lock.acquire(False):
-            return True
-        try:
-            self.queue.set_property("max-size-time", new_max * MS_TO_NS)
-            gstlog("av_sync_tick: target=%i, max=%i→%i",
-                   self.av_sync_target, current_max, new_max)
-        finally:
-            self.level_lock.release()
+        else:
+            new_max = current_max
+        if new_max != current_max and self.level_lock.acquire(False):
+            try:
+                self.queue.set_property("max-size-time", new_max * MS_TO_NS)
+                gstlog("av_sync_tick: target=%i, max=%i→%i",
+                       self.av_sync_target, current_max, new_max)
+            finally:
+                self.level_lock.release()
         return True
 
     def adjust_volume(self) -> bool:

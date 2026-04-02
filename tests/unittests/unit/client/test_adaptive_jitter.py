@@ -58,7 +58,7 @@ def compute_target(delay_window, delay_peaks, mean_ms, stddev_ms, now=None):
 def measure_jitter(arrivals, send_times):
     """
     Simulate jitter measurement from a sequence of (client_arrival, server_time) pairs.
-    Returns the delay_window deque.
+    Returns the delay_window deque.  Applies the same gap/burst filter as the real code.
     """
     window = deque(maxlen=100)
     last_arrival = 0.0
@@ -67,8 +67,9 @@ def measure_jitter(arrivals, send_times):
         if last_arrival > 0 and last_server_time > 0:
             arrival_diff = (arrival - last_arrival) * 1000
             send_diff = server_time - last_server_time
-            D = arrival_diff - send_diff
-            window.append(max(0.0, D))
+            D = max(0.0, arrival_diff - send_diff)
+            if 5 < arrival_diff < 2000:
+                window.append(D)
         last_arrival = arrival
         last_server_time = server_time
     return window
@@ -119,11 +120,29 @@ class TestJitterMeasurement(unittest.TestCase):
     def test_negative_D_clipped_to_zero(self):
         """Early arrivals (negative D) are clipped to 0."""
         send_times = [1000, 1020, 1040]
-        arrivals = [1.0, 1.020, 1.020]  # third packet arrives 20ms early
+        arrivals = [1.0, 1.020, 1.030]  # third packet arrives 10ms early
         window = measure_jitter(arrivals, send_times)
         self.assertEqual(len(window), 2)
         for v in window:
             self.assertGreaterEqual(v, 0.0)
+
+    def test_tunnel_burst_filtered(self):
+        """After a large gap, burst packets are filtered out of the window."""
+        base = 1000
+        send_times = [base + i * 20 for i in range(70)]
+        arrivals = [1.0 + i * 0.020 for i in range(20)]
+        burst_start = arrivals[-1] + 5.0
+        arrivals += [burst_start + i * 0.001 for i in range(50)]
+        window = measure_jitter(arrivals, send_times)
+        # only the 19 normal measurements should be in the window:
+        self.assertEqual(len(window), 19)
+
+    def test_normal_tcp_batching_not_filtered(self):
+        """Packets arriving 10-15ms apart (normal variance) are not filtered."""
+        send_times = [1000 + i * 20 for i in range(30)]
+        arrivals = [1.0 + i * 0.015 for i in range(30)]
+        window = measure_jitter(arrivals, send_times)
+        self.assertEqual(len(window), 29)
 
 
 class TestP95Calculation(unittest.TestCase):

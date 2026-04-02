@@ -710,11 +710,15 @@ class AudioClient(StubClientMixin):
                 arrival_diff = (client_now - self._last_audio_arrival) * 1000
                 send_diff = server_time - self._last_audio_server_time
                 D = max(0.0, arrival_diff - send_diff)
-                self._delay_window.append(D)
-                # record peaks immediately — checking only on the 200ms timer
-                # would miss spikes between ticks:
-                if D > 2 * max(self._cached_p95, 10):
-                    self._delay_peaks.append((client_now, D))
+                # skip measurement after gaps > 2s and during bursts < 5ms:
+                # after an outage, burst packets arrive together with D≈0
+                # which would dilute the window and drop the target:
+                if 5 < arrival_diff < 2000:
+                    self._delay_window.append(D)
+                    # record peaks immediately — checking only on the 200ms timer
+                    # would miss spikes between ticks:
+                    if D > 2 * max(self._cached_p95, 10):
+                        self._delay_peaks.append((client_now, D))
             self._last_audio_arrival = client_now
             self._last_audio_server_time = server_time
         if self.av_sync and self.server_av_sync:

@@ -602,7 +602,7 @@ class AudioClient(StubClientMixin):
     def _on_audio_device_change(self) -> None:
         if self.exit_code is not None:
             return
-        if not self.audio_resume_restart:
+        if not self.audio_sink and not self.audio_resume_restart:
             return
         delay_ms = self._next_device_restart_delay()
         log.info("audio device change detected, restarting speaker in %s seconds", delay_ms / 1000)

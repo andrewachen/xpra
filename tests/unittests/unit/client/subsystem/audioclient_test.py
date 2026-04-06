@@ -254,11 +254,30 @@ class DeviceInvalidationTest(unittest.TestCase):
         finally:
             GLib.timeout_add = original_timeout_add
 
-    def test_device_change_callback_ignores_when_not_flagged(self):
+    def test_device_change_callback_ignores_when_inactive(self):
         x = self.x
         x.audio_resume_restart = False
+        x.audio_sink = None
         x._on_audio_device_change()
         # no crash, no restart — should be a no-op
+
+    def test_device_change_restarts_when_audio_playing(self):
+        from xpra.os_util import gi_import
+        GLib = gi_import("GLib")
+        x = self.x
+        fake_sink = self._make_fake_sink()
+
+        scheduled = []
+        original_timeout_add = GLib.timeout_add
+        GLib.timeout_add = lambda delay, fn, *a: scheduled.append((delay, fn)) or 0
+
+        try:
+            x._on_audio_device_change()
+            assert x.audio_sink is None, "sink should have been stopped"
+            assert len(scheduled) == 1, "expected one timeout, got %s" % len(scheduled)
+            assert scheduled[0][1] == x.start_receiving_audio
+        finally:
+            GLib.timeout_add = original_timeout_add
 
     def test_device_change_backoff_escalates(self):
         from xpra.os_util import gi_import

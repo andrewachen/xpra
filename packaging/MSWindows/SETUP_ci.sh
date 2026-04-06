@@ -15,6 +15,17 @@ set -e
 XPKG="${MINGW_PACKAGE_PREFIX}-"
 PACMAN="pacman --noconfirm --needed -S"
 
+# Architecture-specific compiler flags for all C/C++ compilation
+# (Cython extensions, libsonic, etc.):
+if [ "$MSYSTEM_CARCH" = "aarch64" ]; then
+    export CFLAGS="-mcpu=oryon-1 -O2"
+    export CXXFLAGS="-mcpu=oryon-1 -O2"
+else
+    export CFLAGS="-march=native -O2"
+    export CXXFLAGS="-march=native -O2"
+fi
+echo "Compiler flags: CFLAGS=${CFLAGS}"
+
 # Full system update before installing packages.
 # The workflow caches the entire msys64 prefix, so this only runs on cache miss.
 pacman --noconfirm -Syu

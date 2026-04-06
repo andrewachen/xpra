@@ -250,7 +250,10 @@ class Pipeline(GObject.GObject):
             except Exception:
                 log.estr(details)
             self.update_state("error")
-            self.idle_emit("error", str(err))
+            error_msg = str(err)
+            if details:
+                error_msg += " (%s)" % details.strip().split("\n")[0][:200]
+            self.idle_emit("error", error_msg)
             # exit
             self.cleanup()
         elif t == Gst.MessageType.TAG:

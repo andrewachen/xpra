@@ -117,6 +117,7 @@ class AudioClient(StubClientMixin):
         self._delay_window: deque[float] = deque(maxlen=100)
         self._delay_peaks: deque[tuple[float, float]] = deque(maxlen=8)
         self._cached_p95: float = 0.0
+        self._pitch_logged: bool = False
         # duplicated from ServerInfo mixin:
         self._remote_machine_id = ""
 
@@ -495,6 +496,7 @@ class AudioClient(StubClientMixin):
         self._delay_window.clear()
         self._delay_peaks.clear()
         self._cached_p95 = 0.0
+        self._pitch_logged = False
         ss = self.audio_sink
         log("stop_receiving_audio(%s) audio sink=%s", tell_server, ss)
         if self.speaker_enabled:
@@ -554,9 +556,36 @@ class AudioClient(StubClientMixin):
             return True
         target = max(av_component, jitter_component)
         target = max(20, min(500, int(target)))
-        avsynclog("av-sync target: mean=%.1fms, stddev=%.1fms, p95=%.1fms, "
-                  "av=%i, jitter=%i, target=%ims",
-                  mean_ms, stddev_ms, p95, av_component, jitter_component, target)
+        qinfo = typedict(ss.get_info()).dictget("queue") or {}
+        qi = typedict(qinfo)
+        pitch_status = qi.strget("pitch_status", "")
+        if not self._pitch_logged or (pitch_status and pitch_status != getattr(self, "_last_pitch_status", "")):
+            self._pitch_logged = True
+            self._last_pitch_status = pitch_status
+            if qi.boolget("pitch"):
+                avsynclog("av-sync: tempo %s [%s]",
+                          qi.strget("pitch_backend", "unknown"),
+                          pitch_status or "waiting for caps")
+            else:
+                pitch_err = qi.strget("pitch_error", "")
+                avsynclog("av-sync: tempo not available%s",
+                          ": " + pitch_err if pitch_err else "")
+        tempo = qi.floatget("tempo", 1.0)
+        extra = ""
+        if tempo != 1.0:
+            padded = qi.intget("padded")
+            extra = ", stretched=%i" % qi.intget("tempo_adjusted")
+            if padded:
+                extra += ", padded=%i" % padded
+        probe_errors = qi.intget("probe_errors")
+        if probe_errors:
+            extra += ", probe_errors=%i" % probe_errors
+        avsynclog("av-sync target: p95=%.1fms, jitter=%i, target=%ims, "
+                  "q.cur=%i, q.max=%i, underruns=%i, overruns=%i, tempo=%.2f%s",
+                  p95, jitter_component, target,
+                  qi.intget("cur"), qi.intget("max"),
+                  qi.intget("underruns"), qi.intget("overruns"),
+                  tempo, extra)
         ss.set_av_sync_target(target)
         return True
 

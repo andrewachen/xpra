@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # This file is part of Xpra.
 # Copyright (C) 2010 Antoine Martin <antoine@xpra.org>
+# Copyright (C) 2026 Netflix, Inc.
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
@@ -35,6 +36,19 @@ from xpra.util.thread import start_thread
 from xpra.log import Logger
 
 GLib = gi_import("GLib")
+
+_tempo_error = ""
+_tempo_backend = "none"
+# importing tempo registers the "tempo" BaseTransform element with GStreamer:
+try:
+    from xpra.audio.tempo import tempo_available, get_load_error, get_backend_name
+    _tempo_available = tempo_available()
+    _tempo_backend = get_backend_name()
+    if not _tempo_available:
+        _tempo_error = get_load_error()
+except Exception as e:
+    _tempo_available = False
+    _tempo_error = str(e)
 
 log = Logger("audio")
 gstlog = Logger("gstreamer")
@@ -72,6 +86,53 @@ AV_SYNC_DEAD_BAND_MS = 15
 AV_SYNC_GAIN = 0.3
 AV_SYNC_MAX_STEP_MS = 30
 AV_SYNC_HEADROOM_MS = 30
+
+# NetEQ-inspired tempo control via libsonic or SoundTouch (ctypes).
+# Applied via BaseTransform element — pass-through at tempo=1.0
+# (near-zero cost on LAN), only invokes the library when stretching.
+TEMPO_NORMAL = 1.0
+TEMPO_PREEMPTIVE_EXPAND = 0.975
+TEMPO_ACCELERATE = 1.025
+TEMPO_FAST_ACCELERATE = 1.05
+TEMPO_COOLDOWN_TICKS = 5  # minimum ticks between changes (5 × 200ms = 1 second)
+# Opus default frame duration. Buffer levels quantize in steps of this size,
+# so the "normal" zone must be wider than this to avoid oscillation:
+OPUS_FRAME_MS = 20
+# sonic needs 2 * (48000/65) = 1476 samples ≈ 30ms. Use 2 frames for safety:
+TEMPO_MIN_TARGET_MS = 2 * OPUS_FRAME_MS
+
+
+def compute_tempo(level_ms: int, target_ms: int,
+                  current_tempo: float, ticks_at_tempo: int) -> float:
+    """
+    Decide playback tempo based on current queue level vs target.
+
+    NetEQ-inspired discrete states — slows down to prevent underrun,
+    speeds up to drain excess buffer without dropping audio.
+    """
+    if target_ms < TEMPO_MIN_TARGET_MS:
+        return TEMPO_NORMAL
+    # NetEQ-inspired thresholds (fraction of target buffer):
+    lower_limit = target_ms * 3 // 4
+    # normal zone must be wider than buffer granularity (OPUS_FRAME_MS)
+    # to avoid reacting to normal packet arrival oscillation:
+    higher_limit = max(target_ms, lower_limit + 2 * OPUS_FRAME_MS)
+    # severely overfull — drain aggressively:
+    fast_limit = higher_limit * 4
+    if level_ms <= lower_limit:
+        desired = TEMPO_PREEMPTIVE_EXPAND
+    elif level_ms > fast_limit:
+        desired = TEMPO_FAST_ACCELERATE
+    elif level_ms > higher_limit:
+        desired = TEMPO_ACCELERATE
+    else:
+        desired = TEMPO_NORMAL
+    # override cooldown for emergency: never accelerate while buffer is empty
+    if level_ms == 0 and current_tempo > TEMPO_NORMAL:
+        return TEMPO_PREEMPTIVE_EXPAND
+    if desired != current_tempo and ticks_at_tempo < TEMPO_COOLDOWN_TICKS:
+        return current_tempo
+    return desired
 
 
 def uncompress_data(data: bytes, metadata: dict) -> SizedBuffer:
@@ -132,6 +193,11 @@ class AudioSink(AudioPipeline):
         self.level_lock = Lock()
         self.av_sync_target: int = 0
         self.av_sync_timer: int = 0
+        self.tempo_element = None
+        self.current_tempo: float = TEMPO_NORMAL
+        self.ticks_at_tempo: int = 0
+        self.tempo_count: int = 0
+        self.probe_errors: int = 0
         pipeline_els = [get_element_str("appsrc", get_default_appsrc_attributes())]
         if parser:
             pipeline_els.append(parser)
@@ -149,6 +215,14 @@ class AudioSink(AudioPipeline):
                 "max-size-time": QUEUE_TIME,
                 "leaky": QUEUE_LEAK,
             }))
+        if _tempo_available:
+            pipeline_els.append("audioconvert")
+            pipeline_els.append(plugin_str("capsfilter", {
+                "caps": "audio/x-raw,format=S16LE",
+            }))
+            pipeline_els.append(get_element_str("tempo", {"name": "tempo"}))
+            pipeline_els.append("audioconvert")
+            gstlog("tempo element enabled (BaseTransform, %s)", _tempo_backend)
         pipeline_els.append(get_element_str("volume", {"name": "volume", "volume": 0}))
         if CLOCK_SYNC:
             if not has_plugins("clocksync"):
@@ -177,6 +251,7 @@ class AudioSink(AudioPipeline):
         self.src = self.pipeline.get_by_name("src")
         self.sink = self.pipeline.get_by_name("sink")
         self.queue = self.pipeline.get_by_name("queue")
+        self.tempo_element = self.pipeline.get_by_name("tempo")
         if self.queue:
             if QUEUE_SILENT:
                 self.queue.set_property("silent", False)
@@ -192,6 +267,7 @@ class AudioSink(AudioPipeline):
 
     def cleanup(self) -> None:
         super().cleanup()
+        self.tempo_element = None
         self.cancel_volume_timer()
         self.cancel_av_sync_timer()
         self.sink_type = ""
@@ -270,6 +346,23 @@ class AudioSink(AudioPipeline):
                        self.av_sync_target, current_max, new_max)
             finally:
                 self.level_lock.release()
+        # tempo control via BaseTransform element (libsonic/SoundTouch):
+        if self.tempo_element:
+            level_ms = self.queue.get_property("current-level-time") // MS_TO_NS
+            self.ticks_at_tempo += 1
+            new_tempo = compute_tempo(level_ms, self.av_sync_target,
+                                      self.current_tempo, self.ticks_at_tempo)
+            lower = self.av_sync_target * 3 // 4
+            higher = max(self.av_sync_target, lower + 20)
+            gstlog("av_sync_tick: level=%i, target=%i, limits=[%i,%i], tempo=%.2f, ticks=%i",
+                   level_ms, self.av_sync_target, lower, higher,
+                   self.current_tempo, self.ticks_at_tempo)
+            if new_tempo != self.current_tempo:
+                self.tempo_element.set_tempo(new_tempo)
+                gstlog("av_sync_tick: tempo %.2f→%.2f (level=%i, target=%i)",
+                       self.current_tempo, new_tempo, level_ms, self.av_sync_target)
+                self.current_tempo = new_tempo
+                self.ticks_at_tempo = 0
         return True
 
     def adjust_volume(self) -> bool:
@@ -448,6 +541,14 @@ class AudioSink(AudioPipeline):
                 "overruns": self.overruns,
                 "underruns": self.underruns,
                 "state": self.queue_state,
+                "tempo": self.current_tempo,
+                "pitch": self.tempo_element is not None,
+                "pitch_error": _tempo_error,
+                "pitch_backend": _tempo_backend,
+                "pitch_status": getattr(self.tempo_element, "tempo_status", ""),
+                "tempo_adjusted": getattr(self.tempo_element, "tempo_count", 0),
+                "probe_errors": getattr(self.tempo_element, "probe_errors", 0),
+                "padded": getattr(getattr(self.tempo_element, "_processor", None), "padding_count", 0),
             }
         info["sink"] = self.get_element_properties(
             self.sink,

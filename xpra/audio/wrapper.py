@@ -276,6 +276,9 @@ class AudioSubprocessWrapper(SubprocessCaller):
         self.state = "starting"
         super().start()
         log("start() %s subprocess(%s)=%s", self.description, self.command, self.process.pid)
+        if log.is_debug_enabled():
+            from subprocess import list2cmdline
+            log("  run manually: %s", list2cmdline(self.command))
         GLib.timeout_add(SOUND_START_TIMEOUT, self.verify_started)
 
     def cleanup(self) -> None:

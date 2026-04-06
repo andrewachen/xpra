@@ -95,6 +95,16 @@ curl -sL https://api.nuget.org/v3-flatcontainer/verpatch/1.0.14/verpatch.1.0.14.
 unzip -oj /tmp/verpatch.nupkg lib/win/verpatch.exe -d "$MINGW_PREFIX/bin/"
 rm /tmp/verpatch.nupkg
 
+# libsonic: audio tempo control for jitter buffer (https://github.com/waywardgeek/sonic)
+# Single C file, Apache 2.0 license, no dependencies.
+# Pinned to a specific commit for reproducible builds.
+SONIC_COMMIT="b93885d"
+echo "libsonic: building from waywardgeek/sonic@${SONIC_COMMIT} (${MSYSTEM_CARCH})"
+curl -sL "https://raw.githubusercontent.com/waywardgeek/sonic/${SONIC_COMMIT}/sonic.c" -o /tmp/sonic.c
+curl -sL "https://raw.githubusercontent.com/waywardgeek/sonic/${SONIC_COMMIT}/sonic.h" -o /tmp/sonic.h
+${MINGW_PREFIX}/bin/gcc -shared -O2 -I/tmp -o "${MINGW_PREFIX}/bin/libsonic.dll" /tmp/sonic.c
+rm /tmp/sonic.c /tmp/sonic.h
+
 # Clean pacman's download cache to reduce the size of the CI cache archive.
 # Installed packages are unaffected — this only removes the .pkg.tar.zst files.
 pacman --noconfirm -Scc

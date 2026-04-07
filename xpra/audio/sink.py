@@ -292,7 +292,8 @@ class AudioSink(AudioPipeline):
 
     def _on_device_change(self) -> None:
         log.info("audio output device changed")
-        self.idle_emit("error", "AUDIO_DEVICE_CHANGED")
+        # emit synchronously — idle_emit would race with cleanup:
+        self.emit("error", "AUDIO_DEVICE_CHANGED")
         self.cleanup()
 
     def start_adjust_volume(self, interval: int = 100) -> bool:

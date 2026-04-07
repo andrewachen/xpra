@@ -200,6 +200,13 @@ class AudioSink(AudioPipeline):
         self.ticks_at_tempo: int = 0
         self.tempo_count: int = 0
         self.probe_errors: int = 0
+        # EMA-smoothed buffer level prevents tempo oscillation from
+        # quantized 20ms queue steps (NetEQ's BufferLevelFilter):
+        self._filtered_level: float = 0.0
+        # track ms of audio added/removed by stretching. subtracted from
+        # the raw level so tempo decisions account for prior adjustments
+        # (prevents accelerate→expand→accelerate feedback loop):
+        self._sample_memory: float = 0.0
         pipeline_els = [get_element_str("appsrc", get_default_appsrc_attributes())]
         if parser:
             pipeline_els.append(parser)
@@ -363,21 +370,37 @@ class AudioSink(AudioPipeline):
                 self.level_lock.release()
         # tempo control via BaseTransform element (libsonic/SoundTouch):
         if self.tempo_element:
-            level_ms = self.queue.get_property("current-level-time") // MS_TO_NS
+            raw_level = self.queue.get_property("current-level-time") // MS_TO_NS
+            # adjust for audio added/removed by prior stretching:
+            adjusted = max(0, raw_level - self._sample_memory)
+            # asymmetric EMA: track drops quickly (react to drains before
+            # underrun), track rises slowly (avoid false accelerate triggers):
+            alpha = 0.3 if adjusted < self._filtered_level else 0.1
+            self._filtered_level = alpha * adjusted + (1 - alpha) * self._filtered_level
+            level_ms = int(self._filtered_level)
             self.ticks_at_tempo += 1
             new_tempo = compute_tempo(level_ms, self.av_sync_target,
                                       self.current_tempo, self.ticks_at_tempo)
             lower = self.av_sync_target * 3 // 4
-            higher = max(self.av_sync_target, lower + 20)
-            gstlog("av_sync_tick: level=%i, target=%i, limits=[%i,%i], tempo=%.2f, ticks=%i",
-                   level_ms, self.av_sync_target, lower, higher,
-                   self.current_tempo, self.ticks_at_tempo)
+            higher = max(self.av_sync_target, lower + 2 * OPUS_FRAME_MS)
+            gstlog("av_sync_tick: raw=%i, adj=%i, filt=%i, target=%i, limits=[%i,%i], "
+                   "tempo=%.3f, mem=%.1f, ticks=%i",
+                   raw_level, int(adjusted), level_ms, self.av_sync_target,
+                   lower, higher, self.current_tempo,
+                   self._sample_memory, self.ticks_at_tempo)
             if new_tempo != self.current_tempo:
                 self.tempo_element.set_tempo(new_tempo)
-                gstlog("av_sync_tick: tempo %.2f→%.2f (level=%i, target=%i)",
+                gstlog("av_sync_tick: tempo %.3f→%.3f (filt=%i, target=%i)",
                        self.current_tempo, new_tempo, level_ms, self.av_sync_target)
                 self.current_tempo = new_tempo
                 self.ticks_at_tempo = 0
+                # reset sample memory on tempo change — it tracked
+                # the effect of the previous tempo, not the new one:
+                self._sample_memory = 0.0
+            elif self.current_tempo != TEMPO_NORMAL:
+                # accumulate sample memory: at tempo T, each 20ms tick
+                # adds/removes (T-1.0) * OPUS_FRAME_MS worth of audio:
+                self._sample_memory += (self.current_tempo - 1.0) * OPUS_FRAME_MS
         return True
 
     def adjust_volume(self) -> bool:

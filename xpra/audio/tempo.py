@@ -15,7 +15,7 @@ from xpra.log import Logger
 
 log = Logger("audio")
 
-# "sonic" (default), "soundtouch", or "none":
+# "sonic" (default), "soundtouch", "passthrough" (diagnostic), or "none":
 TEMPO_BACKEND = os.environ.get("XPRA_TEMPO_BACKEND", "sonic").lower()
 
 _load_errors: list[str] = []
@@ -256,6 +256,8 @@ def tempo_available() -> bool:
     """Check if any tempo backend is loadable."""
     if TEMPO_BACKEND == "none":
         return False
+    if TEMPO_BACKEND == "passthrough":
+        return True
     if TEMPO_BACKEND == "sonic":
         return _load_sonic() is not None or _load_soundtouch() is not None
     if TEMPO_BACKEND == "soundtouch":
@@ -270,8 +272,8 @@ def get_load_error() -> str:
 
 def get_backend_name() -> str:
     """Return which backend will be used."""
-    if TEMPO_BACKEND == "none":
-        return "none"
+    if TEMPO_BACKEND in ("none", "passthrough"):
+        return TEMPO_BACKEND
     if TEMPO_BACKEND == "sonic" and _load_sonic():
         return "sonic"
     if TEMPO_BACKEND == "soundtouch" and _load_soundtouch():
@@ -415,7 +417,12 @@ try:
                     return Gst.FlowReturn.OK
 
             try:
-                output = self._processor.process_fixed_size(data)
+                if TEMPO_BACKEND == "passthrough":
+                    # diagnostic: read + write back original data (no processing).
+                    # if this pops, the issue is the pipeline, not the library:
+                    output = data
+                else:
+                    output = self._processor.process_fixed_size(data)
                 ok, map_info = buf.map(Gst.MapFlags.WRITE)
                 if ok:
                     map_info.data[:len(output)] = output

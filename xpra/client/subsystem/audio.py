@@ -34,11 +34,57 @@ DEFAULT_AV_SYNC_DELAY = envint("XPRA_DEFAULT_AV_SYNC_DELAY", 150)
 # estimated constant latency of the local audio output pipeline (Opus decode + PulseAudio):
 AUDIO_PIPELINE_LATENCY_MS = 25
 
-# adaptive jitter buffer sizing (NetEQ-inspired sliding window percentile):
+# adaptive jitter buffer sizing (NetEQ-inspired exponential-decay histogram):
 JITTER_MIN_SAMPLES = 16        # ~320ms at 20ms Opus frames before adaptive kicks in
 MAX_JITTER_BUFFER = 500        # cap jitter buffer at 500ms
-JITTER_PERCENTILE = 0.95       # target 95th percentile of delay variation
+JITTER_PERCENTILE = 0.97       # NetEQ default: 97th percentile
+JITTER_FORGET_FACTOR = 0.983   # NetEQ default: each sample decays old data by ~1.7%
+JITTER_BUCKET_MS = 5           # histogram resolution
+JITTER_NUM_BUCKETS = MAX_JITTER_BUFFER // JITTER_BUCKET_MS
 PEAK_HOLD_SECONDS = 5          # how long peak detection stays active after a spike
+
+
+class DelayHistogram:
+    """Exponential-decay histogram for jitter estimation (NetEQ-inspired).
+
+    Each new sample decays all bucket counts by JITTER_FORGET_FACTOR before
+    incrementing. This naturally weights recent observations more heavily —
+    after ~60 samples, old data has decayed to ~36% weight. No cliff-edge
+    when old samples "fall out" of a fixed window.
+    """
+    def __init__(self):
+        self._buckets = [0.0] * JITTER_NUM_BUCKETS
+        self._count = 0
+
+    def add(self, delay_ms: float) -> None:
+        # decay all buckets:
+        for i in range(len(self._buckets)):
+            self._buckets[i] *= JITTER_FORGET_FACTOR
+        # increment the appropriate bucket:
+        idx = min(int(delay_ms / JITTER_BUCKET_MS), len(self._buckets) - 1)
+        self._buckets[idx] += 1.0
+        self._count += 1
+
+    def percentile(self, pct: float) -> float:
+        """Return the delay value at the given percentile (0.0 to 1.0)."""
+        total = sum(self._buckets)
+        if total == 0:
+            return 0.0
+        threshold = total * pct
+        cumulative = 0.0
+        for i, count in enumerate(self._buckets):
+            cumulative += count
+            if cumulative >= threshold:
+                return (i + 0.5) * JITTER_BUCKET_MS
+        return MAX_JITTER_BUFFER
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    def clear(self) -> None:
+        self._buckets = [0.0] * JITTER_NUM_BUCKETS
+        self._count = 0
 
 
 def init_audio_tagging(tray_icon) -> None:
@@ -110,12 +156,12 @@ class AudioClient(StubClientMixin):
         self.server_audio_send: bool = False
         self.queue_used_sent: int = 0
         self._av_sync_timer: int = 0
-        # jitter estimation state (sliding window of transit time variations):
+        # jitter estimation state (exponential-decay histogram):
         self._last_audio_arrival: float = 0.0
         self._last_audio_server_time: int = 0
-        self._delay_window: deque[float] = deque(maxlen=100)
+        self._delay_histogram = DelayHistogram()
         self._delay_peaks: deque[tuple[float, float]] = deque(maxlen=8)
-        self._cached_p95: float = 0.0
+        self._cached_p97: float = 0.0
         self._pitch_logged: bool = False
         # duplicated from ServerInfo mixin:
         self._remote_machine_id = ""
@@ -219,14 +265,11 @@ class AudioClient(StubClientMixin):
         ss = self.audio_sink
         if ss:
             info["sink"] = ss.get_info()
-        delays = self._delay_window
-        if delays:
-            sorted_delays = sorted(delays)
-            p95_idx = int(JITTER_PERCENTILE * len(delays))
+        hist = self._delay_histogram
+        if hist.count > 0:
             info["jitter"] = {
-                "p95": round(sorted_delays[min(p95_idx, len(sorted_delays) - 1)], 1),
-                "max": round(sorted_delays[-1], 1),
-                "samples": len(delays),
+                "p97": round(hist.percentile(JITTER_PERCENTILE), 1),
+                "samples": hist.count,
                 "peaks": len([1 for t, _ in self._delay_peaks if monotonic() - t < PEAK_HOLD_SECONDS]),
             }
         return {AudioClient.PREFIX: info}
@@ -485,9 +528,9 @@ class AudioClient(StubClientMixin):
             self._av_sync_timer = 0
         self._last_audio_arrival = 0.0
         self._last_audio_server_time = 0
-        self._delay_window.clear()
+        self._delay_histogram.clear()
         self._delay_peaks.clear()
-        self._cached_p95 = 0.0
+        self._cached_p97 = 0.0
         self._pitch_logged = False
         ss = self.audio_sink
         log("stop_receiving_audio(%s) audio sink=%s", tell_server, ss)
@@ -529,19 +572,19 @@ class AudioClient(StubClientMixin):
             av_component = max(mean_ms - AUDIO_PIPELINE_LATENCY_MS, stddev_ms + 10, 0)
         else:
             av_component = 0
-        # network jitter component (95th percentile of transit time variation):
-        delays = self._delay_window
-        if len(delays) >= JITTER_MIN_SAMPLES:
-            p95 = sorted(delays)[int(JITTER_PERCENTILE * len(delays))]
-            self._cached_p95 = p95
-            jitter_component = min(p95, MAX_JITTER_BUFFER)
-            # if a recent peak exceeds p95, hold the buffer at peak level:
+        # network jitter component (97th percentile via exponential-decay histogram):
+        hist = self._delay_histogram
+        if hist.count >= JITTER_MIN_SAMPLES:
+            p97 = hist.percentile(JITTER_PERCENTILE)
+            self._cached_p97 = p97
+            jitter_component = min(p97, MAX_JITTER_BUFFER)
+            # if a recent peak exceeds p97, hold the buffer at peak level:
             now = monotonic()
             active_peaks = [amp for t, amp in self._delay_peaks if now - t < PEAK_HOLD_SECONDS]
             if active_peaks:
                 jitter_component = max(jitter_component, min(max(active_peaks), MAX_JITTER_BUFFER))
         else:
-            p95 = 0.0
+            p97 = 0.0
             jitter_component = 0
         # need at least one valid component:
         if av_component == 0 and jitter_component == 0:
@@ -572,9 +615,9 @@ class AudioClient(StubClientMixin):
         probe_errors = qi.intget("probe_errors")
         if probe_errors:
             extra += ", probe_errors=%i" % probe_errors
-        avsynclog("av-sync target: p95=%.1fms, jitter=%i, target=%ims, "
-                  "q.cur=%i, q.max=%i, underruns=%i, overruns=%i, tempo=%.2f%s",
-                  p95, jitter_component, target,
+        avsynclog("av-sync target: p97=%.1fms, jitter=%i, target=%ims, "
+                  "q.cur=%i, q.max=%i, underruns=%i, overruns=%i, tempo=%.3f%s",
+                  p97, jitter_component, target,
                   qi.intget("cur"), qi.intget("max"),
                   qi.intget("underruns"), qi.intget("overruns"),
                   tempo, extra)
@@ -769,10 +812,10 @@ class AudioClient(StubClientMixin):
                 # after an outage, burst packets arrive together with D≈0
                 # which would dilute the window and drop the target:
                 if 5 < arrival_diff < 2000:
-                    self._delay_window.append(D)
+                    self._delay_histogram.add(D)
                     # record peaks immediately — checking only on the 200ms timer
                     # would miss spikes between ticks:
-                    if D > 2 * max(self._cached_p95, 10):
+                    if D > 2 * max(self._cached_p97, 10):
                         self._delay_peaks.append((client_now, D))
             self._last_audio_arrival = client_now
             self._last_audio_server_time = server_time

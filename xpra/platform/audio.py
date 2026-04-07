@@ -3,7 +3,7 @@
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 # ABOUTME: Cross-platform stubs for audio device change notifications.
-# ABOUTME: Win32 implementation listens for WM_DEVICECHANGE events.
+# ABOUTME: Win32 implementation uses MMDeviceAPI COM notifications.
 
 from collections.abc import Callable
 

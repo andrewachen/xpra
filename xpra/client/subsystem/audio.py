@@ -99,8 +99,7 @@ class AudioClient(StubClientMixin):
         self.audio_in_bytecount: int = 0
         self.audio_out_bytecount: int = 0
         self.audio_resume_restart = False
-        # device change monitoring (e.g. WASAPI headphone unplug on Win32):
-        self._device_change_registered: bool = False
+        # exponential backoff for device-change restarts:
         self._device_restart_delay: float = 0.0
         self.server_av_sync: bool = False
         self.server_pulseaudio_id = ""
@@ -183,9 +182,6 @@ class AudioClient(StubClientMixin):
         self.audio_properties.update(self.get_pa_info())
         # audio tagging:
         init_audio_tagging(opts.tray_icon)
-        from xpra.platform.audio import add_audio_device_change_callback
-        add_audio_device_change_callback(self._on_audio_device_change)
-        self._device_change_registered = True
 
     def get_pa_info(self) -> dict:
         if OSX or not POSIX:
@@ -203,10 +199,6 @@ class AudioClient(StubClientMixin):
         return {}
 
     def cleanup(self) -> None:
-        if self._device_change_registered:
-            from xpra.platform.audio import remove_audio_device_change_callback
-            remove_audio_device_change_callback(self._on_audio_device_change)
-            self._device_change_registered = False
         self.stop_all_audio()
 
     def stop_all_audio(self) -> None:
@@ -607,9 +599,15 @@ class AudioClient(StubClientMixin):
             log("audio_sink_error(%s, %s) not the current sink, ignoring it", audio_sink, error)
             return
         estr = bytestostr(error).replace("gst-resource-error-quark: ", "")
+        if "AUDIO_DEVICE_CHANGED" in estr:
+            # audio subprocess detected a device change — restart immediately:
+            log.info("audio output device changed, restarting speaker")
+            self.stop_receiving_audio()
+            GLib.timeout_add(self.DEVICE_RESTART_INITIAL_MS, self.start_receiving_audio)
+            return
         from xpra.platform.audio import is_recoverable_audio_error
         if is_recoverable_audio_error(estr):
-            # recoverable device error — device change event will trigger restart:
+            # recoverable device error (e.g. WASAPI invalidation before monitor detected it):
             log.info("audio device removed, waiting for new device")
             self.audio_resume_restart = True
         else:
@@ -627,18 +625,6 @@ class AudioClient(StubClientMixin):
         else:
             self._device_restart_delay = min(self._device_restart_delay * 2, self.DEVICE_RESTART_MAX_MS)
         return int(self._device_restart_delay)
-
-    def _on_audio_device_change(self) -> None:
-        if self.exit_code is not None:
-            return
-        if not self.audio_sink and not self.audio_resume_restart:
-            return
-        delay_ms = self._next_device_restart_delay()
-        log.info("audio device change detected, restarting speaker in %s seconds", delay_ms / 1000)
-        self.audio_resume_restart = False
-        if self.audio_sink:
-            self.stop_receiving_audio()
-        GLib.timeout_add(delay_ms, self.start_receiving_audio)
 
     def audio_process_stopped(self, audio_sink, *args) -> None:
         if self.exit_code is not None:

@@ -266,6 +266,8 @@ class AudioSink(AudioPipeline):
         return "AudioSink('%s' - %s)" % (self.pipeline_str, self.state)
 
     def cleanup(self) -> None:
+        from xpra.audio.device_monitor import stop_device_monitor
+        stop_device_monitor()
         super().cleanup()
         self.tempo_element = None
         self.cancel_volume_timer()
@@ -284,7 +286,14 @@ class AudioSink(AudioPipeline):
                 except Exception:
                     pass
         GLib.timeout_add(UNMUTE_DELAY, self.start_adjust_volume)
+        from xpra.audio.device_monitor import start_device_monitor
+        start_device_monitor(self._on_device_change)
         return True
+
+    def _on_device_change(self) -> None:
+        log.info("audio output device changed")
+        self.idle_emit("error", "AUDIO_DEVICE_CHANGED")
+        self.cleanup()
 
     def start_adjust_volume(self, interval: int = 100) -> bool:
         if self.volume_timer != 0:

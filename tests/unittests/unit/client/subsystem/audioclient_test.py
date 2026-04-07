@@ -234,34 +234,7 @@ class DeviceInvalidationTest(unittest.TestCase):
         assert x.audio_sink is None, "sink should have been stopped"
         assert not x.audio_resume_restart, "resume flag should not be set for non-device errors"
 
-    def test_device_change_callback_restarts_when_flagged(self):
-        from xpra.os_util import gi_import
-        GLib = gi_import("GLib")
-        x = self.x
-        x.audio_resume_restart = True
-
-        scheduled = []
-        original_timeout_add = GLib.timeout_add
-        GLib.timeout_add = lambda delay, fn, *a: scheduled.append((delay, fn)) or 0
-
-        try:
-            x._on_audio_device_change()
-            assert len(scheduled) == 1, "expected one timeout, got %s" % len(scheduled)
-            delay, fn = scheduled[0]
-            assert delay == x.DEVICE_RESTART_INITIAL_MS
-            assert fn == x.start_receiving_audio
-            assert not x.audio_resume_restart, "resume flag should be cleared"
-        finally:
-            GLib.timeout_add = original_timeout_add
-
-    def test_device_change_callback_ignores_when_inactive(self):
-        x = self.x
-        x.audio_resume_restart = False
-        x.audio_sink = None
-        x._on_audio_device_change()
-        # no crash, no restart — should be a no-op
-
-    def test_device_change_restarts_when_audio_playing(self):
+    def test_device_changed_signal_restarts(self):
         from xpra.os_util import gi_import
         GLib = gi_import("GLib")
         x = self.x
@@ -272,31 +245,10 @@ class DeviceInvalidationTest(unittest.TestCase):
         GLib.timeout_add = lambda delay, fn, *a: scheduled.append((delay, fn)) or 0
 
         try:
-            x._on_audio_device_change()
+            x.audio_sink_error(fake_sink, "AUDIO_DEVICE_CHANGED")
             assert x.audio_sink is None, "sink should have been stopped"
             assert len(scheduled) == 1, "expected one timeout, got %s" % len(scheduled)
             assert scheduled[0][1] == x.start_receiving_audio
-        finally:
-            GLib.timeout_add = original_timeout_add
-
-    def test_device_change_backoff_escalates(self):
-        from xpra.os_util import gi_import
-        GLib = gi_import("GLib")
-        x = self.x
-
-        scheduled = []
-        original_timeout_add = GLib.timeout_add
-        GLib.timeout_add = lambda delay, fn, *a: scheduled.append((delay, fn)) or 0
-
-        try:
-            for _ in range(3):
-                x.audio_resume_restart = True
-                x._on_audio_device_change()
-
-            assert len(scheduled) == 3
-            assert scheduled[0][0] == 1000
-            assert scheduled[1][0] == 2000
-            assert scheduled[2][0] == 4000
         finally:
             GLib.timeout_add = original_timeout_add
 

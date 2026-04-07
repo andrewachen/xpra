@@ -97,9 +97,21 @@ def _init_mmdevice_com() -> bool:
         return False
 
 
-def _fire_change() -> None:
+def _fire_change_from_main_thread() -> bool:
     from xpra.platform.audio import _fire_audio_device_change
     _fire_audio_device_change()
+    return False    # don't repeat
+
+
+def _schedule_fire_change() -> None:
+    """Schedule the callback on the GLib main loop.
+
+    IMMNotificationClient callbacks arrive on a COM background thread —
+    we must not call into Python/GLib/xpra directly from that thread.
+    """
+    from xpra.os_util import gi_import
+    GLib = gi_import("GLib")
+    GLib.idle_add(_fire_change_from_main_thread)
 
 
 def _create_notifier():
@@ -112,27 +124,22 @@ def _create_notifier():
         def OnDefaultDeviceChanged(self, flow, role, pwstrDefaultDeviceId):
             # eRender=0, eConsole=0 — only react to render+console changes:
             if flow == 0 and role == 0:
-                log("default audio endpoint changed: %s", pwstrDefaultDeviceId)
-                _fire_change()
+                _schedule_fire_change()
             return 0    # S_OK
 
         def OnDeviceStateChanged(self, pwstrDeviceId, dwNewState):
-            log("audio device state changed: %s -> %s", pwstrDeviceId, dwNewState)
-            _fire_change()
+            _schedule_fire_change()
             return 0
 
         def OnDeviceAdded(self, pwstrDeviceId):
-            log("audio device added: %s", pwstrDeviceId)
-            _fire_change()
+            _schedule_fire_change()
             return 0
 
         def OnDeviceRemoved(self, pwstrDeviceId):
-            log("audio device removed: %s", pwstrDeviceId)
-            _fire_change()
+            _schedule_fire_change()
             return 0
 
         def OnPropertyValueChanged(self, pwstrDeviceId, key):
-            log("audio device property changed: %s", pwstrDeviceId)
             return 0    # don't fire for property changes
 
     return AudioEndpointNotifier()

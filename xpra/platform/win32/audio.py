@@ -46,27 +46,8 @@ def _init_mmdevice_com() -> bool:
                           (['out'], POINTER(c_uint), 'pdwState')),
             ]
 
-        class IMMDeviceEnumerator(comtypes.IUnknown):
-            _iid_ = GUID('{A95664D2-9614-4F35-A746-DE8DB63617E6}')
-            _methods_ = [
-                COMMETHOD([], HRESULT, 'EnumAudioEndpoints',
-                          (['in'], c_uint, 'dataFlow'),
-                          (['in'], c_uint, 'dwStateMask'),
-                          (['out'], POINTER(c_void_p), 'ppDevices')),
-                COMMETHOD([], HRESULT, 'GetDefaultAudioEndpoint',
-                          (['in'], c_uint, 'dataFlow'),
-                          (['in'], c_uint, 'role'),
-                          (['out'], POINTER(POINTER(IMMDevice)), 'ppEndpoint')),
-                COMMETHOD([], HRESULT, 'GetDevice',
-                          (['in'], c_wchar_p, 'pwstrId'),
-                          (['out'], POINTER(POINTER(IMMDevice)), 'ppDevice')),
-                COMMETHOD([], HRESULT, 'RegisterEndpointNotificationCallback',
-                          (['in'], c_void_p, 'pClient')),
-                COMMETHOD([], HRESULT, 'UnregisterEndpointNotificationCallback',
-                          (['in'], c_void_p, 'pClient')),
-            ]
-
-        # IMMNotificationClient — implemented by us, called back by Windows:
+        # IMMNotificationClient — implemented by us, called back by Windows
+        # (defined before IMMDeviceEnumerator so it can be referenced):
         class IMMNotificationClient(comtypes.IUnknown):
             _iid_ = GUID('{7991EEC9-7E89-4D85-8390-6C703CEC60C0}')
             _methods_ = [
@@ -84,6 +65,26 @@ def _init_mmdevice_com() -> bool:
                 COMMETHOD([], HRESULT, 'OnPropertyValueChanged',
                           (['in'], c_wchar_p, 'pwstrDeviceId'),
                           (['in'], c_void_p, 'key')),
+            ]
+
+        class IMMDeviceEnumerator(comtypes.IUnknown):
+            _iid_ = GUID('{A95664D2-9614-4F35-A746-DE8DB63617E6}')
+            _methods_ = [
+                COMMETHOD([], HRESULT, 'EnumAudioEndpoints',
+                          (['in'], c_uint, 'dataFlow'),
+                          (['in'], c_uint, 'dwStateMask'),
+                          (['out'], POINTER(c_void_p), 'ppDevices')),
+                COMMETHOD([], HRESULT, 'GetDefaultAudioEndpoint',
+                          (['in'], c_uint, 'dataFlow'),
+                          (['in'], c_uint, 'role'),
+                          (['out'], POINTER(POINTER(IMMDevice)), 'ppEndpoint')),
+                COMMETHOD([], HRESULT, 'GetDevice',
+                          (['in'], c_wchar_p, 'pwstrId'),
+                          (['out'], POINTER(POINTER(IMMDevice)), 'ppDevice')),
+                COMMETHOD([], HRESULT, 'RegisterEndpointNotificationCallback',
+                          (['in'], POINTER(IMMNotificationClient), 'pClient')),
+                COMMETHOD([], HRESULT, 'UnregisterEndpointNotificationCallback',
+                          (['in'], POINTER(IMMNotificationClient), 'pClient')),
             ]
 
         _IMMNotificationClient = IMMNotificationClient
@@ -150,7 +151,9 @@ def add_audio_device_change_callback(callback) -> None:
         import comtypes                         # pylint: disable=import-outside-toplevel
         _enumerator = comtypes.CoCreateInstance(_CLSID_MMDeviceEnumerator, interface=_IMMDeviceEnumerator)
         _notifier = _create_notifier()
-        _enumerator.RegisterEndpointNotificationCallback(_notifier)
+        # pass the IMMNotificationClient interface pointer to Register:
+        notifier_ptr = _notifier.QueryInterface(_IMMNotificationClient)
+        _enumerator.RegisterEndpointNotificationCallback(notifier_ptr)
         log("registered audio endpoint notification callback")
     except Exception:
         log("add_audio_device_change_callback()", exc_info=True)
@@ -166,7 +169,8 @@ def remove_audio_device_change_callback(callback) -> None:
         _audio_device_change_callbacks.remove(callback)
     if len(_audio_device_change_callbacks) == 0 and _enumerator and _notifier:
         try:
-            _enumerator.UnregisterEndpointNotificationCallback(_notifier)
+            notifier_ptr = _notifier.QueryInterface(_IMMNotificationClient)
+            _enumerator.UnregisterEndpointNotificationCallback(notifier_ptr)
             log("unregistered audio endpoint notification callback")
         except Exception:
             log("remove_audio_device_change_callback()", exc_info=True)

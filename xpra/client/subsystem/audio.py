@@ -600,10 +600,10 @@ class AudioClient(StubClientMixin):
             return
         estr = bytestostr(error).replace("gst-resource-error-quark: ", "")
         if "AUDIO_DEVICE_CHANGED" in estr:
-            # audio subprocess detected a device change — restart immediately:
+            # audio subprocess detected a device change — restart quickly:
             log.info("audio output device changed, restarting speaker")
             self.stop_receiving_audio()
-            GLib.timeout_add(self.DEVICE_RESTART_INITIAL_MS, self.start_receiving_audio)
+            GLib.timeout_add(200, self.start_receiving_audio)
             return
         from xpra.platform.audio import is_recoverable_audio_error
         if is_recoverable_audio_error(estr):

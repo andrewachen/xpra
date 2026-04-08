@@ -90,6 +90,17 @@ class ServerWebSocketConnection(XpraQuicConnection):
             self.send_headers(self.stream_id, headers={":status": code})
             self.transmit()
 
+    def is_substream_packet(self, packet_type: str) -> bool:
+        """Check if a packet type is routed to a substream (not the main WebSocket stream)."""
+        if not self._use_substreams or not packet_type:
+            return False
+        if not any(packet_type.startswith(x) for x in SUBSTREAM_PACKET_TYPES):
+            return False
+        stream_type = packet_type.split("-", 1)[0]
+        stream_id = self._packet_type_streams.get(stream_type)
+        # only true if we've already allocated the substream (not still pending)
+        return stream_id is not None and stream_id != self.stream_id
+
     def get_packet_stream_id(self, packet_type: str) -> int:
         if self.closed or not self._use_substreams or not packet_type:
             return self.stream_id

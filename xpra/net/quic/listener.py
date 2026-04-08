@@ -18,7 +18,7 @@ from aioquic.h3.events import (
     HeadersReceived,
     WebTransportStreamDataReceived,
 )
-from aioquic.quic.events import DatagramFrameReceived, ProtocolNegotiated, QuicEvent
+from aioquic.quic.events import DatagramFrameReceived, ProtocolNegotiated, QuicEvent, StreamDataReceived
 
 from xpra.net.quic.common import MAX_DATAGRAM_FRAME_SIZE
 from xpra.net.quic.http import HttpRequestHandler
@@ -47,7 +47,12 @@ class HttpServerProtocol(QuicConnectionProtocol):
         log(f"HttpServerProtocol({args}, {kwargs}) xpra-server={self._xpra_server}")
         super().__init__(*args, **kwargs)
         self._handlers: dict[int, Handler] = {}
+        self._substream_handlers: dict[int, Handler] = {}
         self._http: HttpConnection | None = None
+
+    def register_substream(self, stream_id: int, handler: Handler) -> None:
+        log(f"register_substream({stream_id}, {handler})")
+        self._substream_handlers[stream_id] = handler
 
     def quic_event_received(self, event: QuicEvent) -> None:
         log("hsp:quic_event_received(%s)", Ellipsizer(event))
@@ -58,7 +63,12 @@ class HttpServerProtocol(QuicConnectionProtocol):
                 self._http = H0Connection(self._quic)
         elif isinstance(event, DatagramFrameReceived) and event.data == b"quack":
             self._quic.send_datagram_frame(b"quack-ack")
-        #  pass event to the HTTP layer
+        # route raw QUIC substreams directly, bypassing H3
+        if isinstance(event, StreamDataReceived) and event.stream_id in self._substream_handlers:
+            log(f"substream {event.stream_id}: received {len(event.data)} bytes")
+            self._substream_handlers[event.stream_id].read_queue.put(event.data)
+            return
+        # pass event to the HTTP layer
         log(f"hsp:quic_event_received(..) http={self._http}")
         if self._http is not None:
             for http_event in self._http.handle_event(event):
@@ -139,7 +149,8 @@ class HttpServerProtocol(QuicConnectionProtocol):
             }
             wsc = ServerWebSocketConnection(connection=self._http, scope=scope,
                                             stream_id=event.stream_id,
-                                            transmit=self.transmit)
+                                            transmit=self.transmit,
+                                            register_substream=self.register_substream)
             socket_options = {}
             self._xpra_server.make_protocol("quic", wsc, socket_options, protocol_class=WebSocketProtocol)
             return wsc

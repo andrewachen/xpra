@@ -279,10 +279,11 @@ def main():
             m_p95 = sorted(m_ia)[int(len(m_ia) * 0.95)]
             s_jitter = statistics.stdev(s_ia)
             m_jitter = statistics.stdev(m_ia)
-            improvement = ((s_p95 - m_p95) / s_p95 * 100) if s_p95 > 0 else 0
+            p95_change = ((s_p95 - m_p95) / s_p95 * 100) if s_p95 > 0 else 0
+            jitter_change = ((s_jitter - m_jitter) / s_jitter * 100) if s_jitter > 0 else 0
             print(f"\n  {cat}:")
-            print(f"    p95: {s_p95:.1f}ms -> {m_p95:.1f}ms ({improvement:+.0f}%)")
-            print(f"    jitter: {s_jitter:.1f}ms -> {m_jitter:.1f}ms")
+            print(f"    p95: {s_p95:.1f}ms -> {m_p95:.1f}ms ({p95_change:+.0f}%)")
+            print(f"    jitter: {s_jitter:.1f}ms -> {m_jitter:.1f}ms ({jitter_change:+.0f}%)")
 
 
 if __name__ == "__main__":

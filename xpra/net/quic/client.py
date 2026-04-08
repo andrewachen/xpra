@@ -138,7 +138,7 @@ class WebSocketClient(QuicConnectionProtocol):
         websocket = self._substream_map.get(stream_id)
         if websocket:
             log(f"substream {stream_id}: {len(event.data)} bytes")
-            websocket.read_queue.put(event.data)
+            websocket.put_raw_substream_data(event.data, stream_id)
             return True
         # only intercept server-initiated bidirectional streams
         # (server-initiated unidirectional streams are used by H3 internally)
@@ -166,7 +166,7 @@ class WebSocketClient(QuicConnectionProtocol):
         log.info(f"new substream {stream_id} for {stream_type!r} packets")
         if remainder:
             log(f"substream {stream_id}: delivering {len(remainder)} bytes after header")
-            websocket.read_queue.put(remainder)
+            websocket.put_raw_substream_data(remainder, stream_id)
         return True
 
     def quic_event_received(self, event: QuicEvent) -> None:

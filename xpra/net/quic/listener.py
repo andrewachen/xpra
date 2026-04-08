@@ -66,7 +66,7 @@ class HttpServerProtocol(QuicConnectionProtocol):
         # route raw QUIC substreams directly, bypassing H3
         if isinstance(event, StreamDataReceived) and event.stream_id in self._substream_handlers:
             log(f"substream {event.stream_id}: received {len(event.data)} bytes")
-            self._substream_handlers[event.stream_id].read_queue.put(event.data)
+            self._substream_handlers[event.stream_id].put_raw_substream_data(event.data, event.stream_id)
             return
         # pass event to the HTTP layer
         log(f"hsp:quic_event_received(..) http={self._http}")

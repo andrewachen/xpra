@@ -34,6 +34,9 @@ class WebSocketProtocol(SocketProtocol):
         self._process_read = self.parse_ws_frame
         self.make_chunk_header: Callable = self.make_xpra_header
         self.make_frame_header: Callable = self.make_wsframe_header
+        # wire up raw substream delivery to bypass WS framing
+        if hasattr(self._conn, "_raw_read_cb"):
+            self._conn._raw_read_cb = self.substream_read_queue_put
 
     def __repr__(self):
         return f"WebSocket({self._conn})"
@@ -53,6 +56,10 @@ class WebSocketProtocol(SocketProtocol):
         self.flush_then_close(None, data)
 
     def make_wsframe_header(self, packet_type: str, items: list[SizedBuffer]) -> bytes:
+        # skip WebSocket framing for packets routed to raw QUIC substreams
+        is_substream = getattr(self._conn, "is_substream_packet", None)
+        if is_substream and is_substream(packet_type):
+            return b""
         payload_len = sum(len(item) for item in items)
         header = encode_hybi_header(OPCODE.BINARY, payload_len, self.ws_mask)
         log("make_wsframe_header(%s, %i items) %i bytes, ws_mask=%s, header=0x%s (%i bytes)",

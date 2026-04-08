@@ -45,6 +45,7 @@ class XpraQuicConnection(Connection):
         self.socktype_wrapped = "quic"
         self.connection: HttpConnection = connection
         self.read_queue: SimpleQueue[bytes] = SimpleQueue()
+        self._raw_read_cb: Callable[[bytes], None] | None = None
         self.stream_id: int = stream_id
         self.transmit: Callable[[], None] = transmit
         self.accepted: bool = False
@@ -149,6 +150,14 @@ class XpraQuicConnection(Connection):
 
     def get_packet_stream_id(self, packet_type: str) -> int:
         return self.stream_id
+
+    def put_raw_substream_data(self, data: bytes, stream_id: int = 1) -> None:
+        """Deliver substream data directly to the xpra packet parser, bypassing WebSocket framing."""
+        log(f"put_raw_substream_data: {len(data)} bytes on stream {stream_id}")
+        if self._raw_read_cb:
+            self._raw_read_cb(data, stream_id)
+        else:
+            log.warn("Warning: raw substream data received but no parser callback set")
 
     def read(self, n: int) -> bytes:
         log("quic.read(%s)", n)

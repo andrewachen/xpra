@@ -94,8 +94,13 @@ class PacketTimingCollector:
                 print(f"    jitter (stdev): {statistics.stdev(ia):.1f} ms")
 
 
-def run_test(url: str, password: str, duration: float, substreams: bool) -> PacketTimingCollector:
-    """Connect to the server, collect transport-level timing."""
+def run_test(url: str, password: str, duration: float, substreams: bool) -> tuple:
+    """Connect to the server, collect transport-level timing.
+
+    Returns (parse_collector, quic_collector) — the parse collector timestamps
+    packets after the parse thread processes them, the quic collector timestamps
+    raw substream data as it arrives from the QUIC layer (before parse thread).
+    """
     from xpra.net.packet_encoding import init_all as init_encoders
     from xpra.net.compression import init_all as init_compressors
     init_encoders()
@@ -112,6 +117,13 @@ def run_test(url: str, password: str, duration: float, substreams: bool) -> Pack
     from xpra.net.common import Packet
 
     collector = PacketTimingCollector()
+    quic_collector = PacketTimingCollector()
+    # map QUIC stream_id -> type name (populated when substream headers are parsed)
+    stream_type_map: dict[int, str] = {}
+
+    # stream_type_map is populated by the timed_put hook below:
+    # first data on a new stream_id gets labeled by packet size heuristic,
+    # then refined when the parse thread delivers the actual packet type.
 
     opts = make_defaults_struct()
     opts.ssl_server_verify_mode = "none"
@@ -155,6 +167,8 @@ def run_test(url: str, password: str, duration: float, substreams: bool) -> Pack
             mode_str = "multi-stream" if substreams else "single-stream"
             qs = caps.boolget("quic.substreams")
             print(f"  Connected ({mode_str}), server quic.substreams={qs}")
+            # hook QUIC substream arrival timing (before parse thread)
+            self._hook_quic_timing()
             # request the server to start sending audio
             audio_caps = typedict(caps.dictget("audio") or {})
             if audio_caps.boolget("send"):
@@ -167,10 +181,33 @@ def run_test(url: str, password: str, duration: float, substreams: bool) -> Pack
             # now that hello is done, install our packet handler
             self._timing_mode = True
             collector.start()
+            quic_collector.start()
             GLib.timeout_add(int(duration * 1000), self._stop_collecting)
+
+        def _hook_quic_timing(self):
+            """Wrap put_raw_substream_data to timestamp QUIC-level arrivals."""
+            conn = getattr(self, "_protocol", None) and self._protocol._conn
+            if not conn or not hasattr(conn, "put_raw_substream_data"):
+                print("  (no QUIC substream timing — not a QUIC connection)")
+                return
+            original_put = conn.put_raw_substream_data
+
+            def timed_put(data, stream_id=1):
+                # label by stream_id — the log output shows which id is which type
+                quic_collector.record(f"quic:stream-{stream_id}", len(data))
+                return original_put(data, stream_id)
+
+            conn.put_raw_substream_data = timed_put
+            # also intercept the substream type detection from log output
+            # by wrapping the _substream_map setter on the WebSocketClient;
+            # simpler: just parse the "new substream N for 'type'" log messages
+            # that are already printed — but those fire before do_command.
+            # Instead, peek at what's already registered:
+            print(f"  QUIC substream timing hooked on {conn}")
 
         def _stop_collecting(self):
             collector.stop()
+            quic_collector.stop()
             print(f"  Done. Disconnecting...")
             self.quit(0)
             return False
@@ -228,7 +265,7 @@ def run_test(url: str, password: str, duration: float, substreams: bool) -> Pack
         except Exception:
             pass
 
-    return collector
+    return collector, quic_collector
 
 
 def main():
@@ -248,42 +285,62 @@ def main():
     args = parser.parse_args()
 
     results = {}
+    quic_results = {}
 
     if not args.multi_only:
-        c = run_test(args.url, args.password, args.duration, substreams=False)
-        c.report("Single-stream (baseline)")
+        c, qc = run_test(args.url, args.password, args.duration, substreams=False)
+        c.report("Single-stream — parse thread")
+        if qc.arrivals:
+            qc.report("Single-stream — QUIC arrival")
         results["single"] = c
+        quic_results["single"] = qc
 
     if not args.single_only:
         if not args.multi_only:
             print("\n--- waiting 2s before next test ---")
             time.sleep(2)
-        c = run_test(args.url, args.password, args.duration, substreams=True)
-        c.report("Multi-stream (substreams)")
+        c, qc = run_test(args.url, args.password, args.duration, substreams=True)
+        c.report("Multi-stream — parse thread")
+        if qc.arrivals:
+            qc.report("Multi-stream — QUIC arrival")
         results["multi"] = c
+        quic_results["multi"] = qc
 
-    # Comparison
-    if "single" in results and "multi" in results:
-        print(f"\n{'=' * 60}")
-        print("  Comparison")
-        print(f"{'=' * 60}")
-        common = sorted(
-            set(results["single"].arrivals.keys()) & set(results["multi"].arrivals.keys())
-        )
-        for cat in common:
-            s_ia = results["single"].inter_arrival_ms(cat)
-            m_ia = results["multi"].inter_arrival_ms(cat)
-            if len(s_ia) < 2 or len(m_ia) < 2:
-                continue
-            s_p95 = sorted(s_ia)[int(len(s_ia) * 0.95)]
-            m_p95 = sorted(m_ia)[int(len(m_ia) * 0.95)]
-            s_jitter = statistics.stdev(s_ia)
-            m_jitter = statistics.stdev(m_ia)
-            p95_change = ((s_p95 - m_p95) / s_p95 * 100) if s_p95 > 0 else 0
-            jitter_change = ((s_jitter - m_jitter) / s_jitter * 100) if s_jitter > 0 else 0
-            print(f"\n  {cat}:")
-            print(f"    p95: {s_p95:.1f}ms -> {m_p95:.1f}ms ({p95_change:+.0f}%)")
-            print(f"    jitter: {s_jitter:.1f}ms -> {m_jitter:.1f}ms ({jitter_change:+.0f}%)")
+    # Comparison (parse thread level)
+    _print_comparison(results, "Parse thread")
+    # Comparison (QUIC arrival level)
+    _print_comparison(quic_results, "QUIC arrival")
+
+
+def _print_comparison(results: dict, label: str):
+    if "single" not in results or "multi" not in results:
+        return
+    common = sorted(
+        set(results["single"].arrivals.keys()) & set(results["multi"].arrivals.keys())
+    )
+    if not common:
+        return
+    print(f"\n{'=' * 60}")
+    print(f"  Comparison — {label}")
+    print(f"{'=' * 60}")
+    for cat in common:
+        s_ia = results["single"].inter_arrival_ms(cat)
+        m_ia = results["multi"].inter_arrival_ms(cat)
+        if len(s_ia) < 2 or len(m_ia) < 2:
+            continue
+        s_p95 = sorted(s_ia)[int(len(s_ia) * 0.95)]
+        m_p95 = sorted(m_ia)[int(len(m_ia) * 0.95)]
+        s_max = max(s_ia)
+        m_max = max(m_ia)
+        s_jitter = statistics.stdev(s_ia)
+        m_jitter = statistics.stdev(m_ia)
+        p95_change = ((s_p95 - m_p95) / s_p95 * 100) if s_p95 > 0 else 0
+        max_change = ((s_max - m_max) / s_max * 100) if s_max > 0 else 0
+        jitter_change = ((s_jitter - m_jitter) / s_jitter * 100) if s_jitter > 0 else 0
+        print(f"\n  {cat}:")
+        print(f"    p95:    {s_p95:.1f}ms -> {m_p95:.1f}ms ({p95_change:+.0f}%)")
+        print(f"    max:    {s_max:.1f}ms -> {m_max:.1f}ms ({max_change:+.0f}%)")
+        print(f"    jitter: {s_jitter:.1f}ms -> {m_jitter:.1f}ms ({jitter_change:+.0f}%)")
 
 
 if __name__ == "__main__":

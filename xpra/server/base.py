@@ -2,6 +2,7 @@
 # Copyright (C) 2011 Serviware (Arthur Huillet, <ahuillet@serviware.com>)
 # Copyright (C) 2010 Antoine Martin <antoine@xpra.org>
 # Copyright (C) 2008 Nathaniel Smith <njs@pobox.com>
+# Copyright (C) 2026 Netflix, Inc.
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
@@ -285,6 +286,8 @@ class ServerBase(ServerBaseClass):
         conn = proto._conn
         if c.boolget("quic.substreams") and hasattr(conn, "_use_substreams"):
             conn._use_substreams = True
+            if hasattr(conn, "_audio_direct_write"):
+                conn._audio_direct_write = True
             log.info("enabling QUIC substreams for this client")
 
         def drop_client(reason="unknown", *args) -> None:

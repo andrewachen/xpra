@@ -1,5 +1,6 @@
 # This file is part of Xpra.
 # Copyright (C) 2022 Antoine Martin <antoine@xpra.org>
+# Copyright (C) 2026 Netflix, Inc.
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
@@ -46,6 +47,7 @@ class XpraQuicConnection(Connection):
         self.connection: HttpConnection = connection
         self.read_queue: SimpleQueue[bytes] = SimpleQueue()
         self._raw_read_cb: Callable[[bytes], None] | None = None
+        self._audio_pipe_writer = None
         self.stream_id: int = stream_id
         self.transmit: Callable[[], None] = transmit
         self.accepted: bool = False
@@ -127,7 +129,7 @@ class XpraQuicConnection(Connection):
             log(f"sending {packet_type!r} using datagram")
             return len(buf)
         stream_id = self.get_packet_stream_id(packet_type)
-        log("quic.stream_write(%s, %s) using stream id %s", Ellipsizer(buf), packet_type, stream_id)
+        log("%s.stream_write(%s, %s) using stream id %s", self, Ellipsizer(buf), packet_type, stream_id)
 
         def do_write() -> None:
             if self.closed:
@@ -158,6 +160,11 @@ class XpraQuicConnection(Connection):
             self._raw_read_cb(data, stream_id)
         else:
             log.warn("Warning: raw substream data received but no parser callback set")
+
+    def set_audio_pipe_writer(self, writer) -> None:
+        """Set the PipeWriter for direct audio delivery to the audio subprocess."""
+        log("set_audio_pipe_writer(%s)", writer)
+        self._audio_pipe_writer = writer
 
     def read(self, n: int) -> bytes:
         log("quic.read(%s)", n)

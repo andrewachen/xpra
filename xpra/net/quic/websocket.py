@@ -1,5 +1,6 @@
 # This file is part of Xpra.
 # Copyright (C) 2022 Antoine Martin <antoine@xpra.org>
+# Copyright (C) 2026 Netflix, Inc.
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
@@ -37,6 +38,7 @@ class ServerWebSocketConnection(XpraQuicConnection):
         self._pending_substreams: set[str] = set()
         # substreams start disabled; enabled after client capability negotiation
         self._use_substreams = False
+        self._audio_direct_write = False
         self._register_substream = register_substream
 
     def get_info(self) -> dict[str, Any]:
@@ -154,3 +156,21 @@ class ServerWebSocketConnection(XpraQuicConnection):
         else:
             # main WebSocket stream — use H3 DATA frames
             super().do_write(stream_id, data)
+
+    def is_audio_stream_ready(self) -> bool:
+        """Check if the sound substream is allocated and ready for direct writes."""
+        stream_id = self._packet_type_streams.get("sound")
+        return stream_id is not None and stream_id in self._substream_ids
+
+    def write_audio_direct(self, wire_data: bytes) -> None:
+        """Write pre-encoded audio data directly to the sound substream.
+
+        Called from the asyncio event loop. Bypasses the protocol format thread
+        and write queue, eliminating contention with draw packets.
+        """
+        stream_id = self._packet_type_streams.get("sound")
+        if not stream_id or stream_id not in self._substream_ids:
+            log.warn("Warning: write_audio_direct called but no sound substream allocated")
+            return
+        self.connection._quic.send_stream_data(stream_id=stream_id, data=wire_data, end_stream=self.closed)
+        self.transmit()

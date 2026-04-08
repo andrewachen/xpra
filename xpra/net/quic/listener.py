@@ -55,6 +55,25 @@ class HttpServerProtocol(QuicConnectionProtocol):
         log(f"register_substream({stream_id}, {handler})")
         self._substream_handlers[stream_id] = handler
 
+    def connection_lost(self, exc) -> None:
+        log.info("QUIC connection lost (%d handlers): %s", len(self._handlers), exc)
+        # close all websocket/webtransport handlers so the xpra protocol
+        # detects the disconnect and cleans up (audio sources, etc.)
+        for handler in self._handlers.values():
+            log.info("closing handler %s", handler)
+            try:
+                if not getattr(handler, "closed", True):
+                    handler.close()
+                # unblock the SocketProtocol read thread
+                rq = getattr(handler, "read_queue", None)
+                if rq:
+                    rq.put(b"")
+            except Exception:
+                log("error closing handler %s", handler, exc_info=True)
+        self._handlers.clear()
+        self._substream_handlers.clear()
+        super().connection_lost(exc)
+
     def quic_event_received(self, event: QuicEvent) -> None:
         log("hsp:quic_event_received(%s)", Ellipsizer(event))
         if isinstance(event, ProtocolNegotiated):

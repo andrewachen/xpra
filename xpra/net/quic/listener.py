@@ -35,7 +35,8 @@ from xpra.log import Logger
 
 log = Logger("quic")
 
-quic_logger = QuicLogger()
+# qlog records every QUIC frame into memory — significant GC pressure at high throughput
+quic_logger = QuicLogger() if log.is_debug_enabled() else None
 
 HttpConnection = Union[H0Connection, H3Connection]
 Handler = Union[HttpRequestHandler, ServerWebSocketConnection, ServerWebTransportConnection]

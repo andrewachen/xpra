@@ -249,6 +249,13 @@ def quic_connect(host: str, port: int, path: str, fast_open: bool,
         max_datagram_frame_size=MAX_DATAGRAM_FRAME_SIZE,
     )
     configuration.verify_mode = parse_ssl_verify_mode(ssl_server_verify_mode)
+    if not ssl_ca_certs:
+        try:
+            import certifi
+            ssl_ca_certs = certifi.where()
+            log(f"using certifi CA bundle: {ssl_ca_certs}")
+        except (ImportError, FileNotFoundError):
+            log("certifi not available, no default CA bundle")
     if ssl_ca_certs:
         configuration.load_verify_locations(ssl_ca_certs)
     if ssl_cert:

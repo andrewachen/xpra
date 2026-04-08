@@ -35,7 +35,8 @@ class ServerWebSocketConnection(XpraQuicConnection):
         self._packet_type_streams: dict[str, int] = {}
         self._substream_ids: set[int] = set()
         self._pending_substreams: set[str] = set()
-        self._use_substreams = bool(SUBSTREAM_PACKET_TYPES)
+        # substreams start disabled; enabled after client capability negotiation
+        self._use_substreams = False
         self._register_substream = register_substream
 
     def get_info(self) -> dict[str, Any]:

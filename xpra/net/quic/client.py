@@ -266,12 +266,26 @@ def quic_connect(host: str, port: int, path: str, fast_open: bool,
     )
     configuration.verify_mode = parse_ssl_verify_mode(ssl_server_verify_mode)
     if not ssl_ca_certs:
+        # find the CA bundle — certifi.where() may return a stale build-time path
+        # in cx_Freeze frozen builds, so also check relative to the executable
+        ca_candidates = []
         try:
             import certifi
-            ssl_ca_certs = certifi.where()
-            log(f"using certifi CA bundle: {ssl_ca_certs}")
-        except (ImportError, FileNotFoundError):
-            log("certifi not available, no default CA bundle")
+            ca_candidates.append(certifi.where())
+        except ImportError:
+            pass
+        # frozen build: cacert.pem is next to the executable in lib/certifi/
+        import sys
+        exe_dir = os.path.dirname(getattr(sys, "executable", ""))
+        if exe_dir:
+            ca_candidates.append(os.path.join(exe_dir, "lib", "certifi", "cacert.pem"))
+        for ca_path in ca_candidates:
+            if ca_path and os.path.exists(ca_path):
+                ssl_ca_certs = ca_path
+                log(f"using CA bundle: {ssl_ca_certs}")
+                break
+        else:
+            log("no CA bundle found, certificate verification may fail")
     if ssl_ca_certs:
         configuration.load_verify_locations(ssl_ca_certs)
     if ssl_cert:

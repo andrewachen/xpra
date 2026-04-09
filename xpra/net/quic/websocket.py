@@ -33,12 +33,9 @@ class ServerWebSocketConnection(XpraQuicConnection):
                  register_substream: Callable[[int, "ServerWebSocketConnection"], None] | None = None):
         super().__init__(connection, stream_id, transmit, "", 0, "wss", info=None, options=None)
         self.scope: dict = scope
-        self._packet_type_streams: dict[str, int] = {}
-        self._substream_ids: set[int] = set()
-        self._pending_substreams: set[str] = set()
-        # substreams start disabled; enabled after client capability negotiation
-        self._use_substreams = False
         self._audio_direct_write = False
+        # configure server-specific substream packet types
+        self._substream_packet_types = SUBSTREAM_PACKET_TYPES
         self._register_substream = register_substream
 
     def get_info(self) -> dict[str, Any]:
@@ -96,83 +93,12 @@ class ServerWebSocketConnection(XpraQuicConnection):
         """Check if a packet type is routed to a substream (not the main WebSocket stream)."""
         if not self._use_substreams or not packet_type:
             return False
-        if not any(packet_type.startswith(x) for x in SUBSTREAM_PACKET_TYPES):
+        if not any(packet_type.startswith(x) for x in self._substream_packet_types):
             return False
         stream_type = packet_type.split("-", 1)[0]
         stream_id = self._packet_type_streams.get(stream_type)
         # only true if we've already allocated the substream (not still pending)
         return stream_id is not None and stream_id != self.stream_id
-
-    def get_packet_stream_id(self, packet_type: str) -> int:
-        if self.closed or not self._use_substreams or not packet_type:
-            return self.stream_id
-        if not any(packet_type.startswith(x) for x in SUBSTREAM_PACKET_TYPES):
-            return self.stream_id
-        # ie: "sound-data" -> "sound"
-        stream_type = packet_type.split("-", 1)[0]
-        stream_id = self._packet_type_streams.get(stream_type)
-        if stream_id is not None:
-            # already allocated substream:
-            return stream_id
-        # reserve the stream type so we don't retry on the next packet;
-        # actual allocation happens on the asyncio loop in _allocate_substream()
-        self._packet_type_streams[stream_type] = self.stream_id
-        self._pending_substreams.add(stream_type)
-        return self.stream_id
-
-    def _allocate_substream(self, stream_type: str) -> None:
-        """Allocate a raw QUIC stream for a packet type. Must run on the asyncio loop."""
-        log(f"_allocate_substream({stream_type!r})")
-        quic = self.connection._quic
-        try:
-            stream_id = quic.get_next_available_stream_id()
-        except Exception:
-            log(f"unable to allocate new stream-id for {stream_type!r}", exc_info=True)
-            log.warn(f"Warning: unable to allocate a new stream-id for {stream_type!r}")
-            self._use_substreams = False
-            return
-        # send type prefix as first bytes (QUIC guarantees in-order per-stream)
-        header = f"xpra:{stream_type}\n".encode()
-        log(f"sending substream header on stream {stream_id}: {header!r}")
-        quic.send_stream_data(stream_id, header)
-        self._substream_ids.add(stream_id)
-        self._packet_type_streams[stream_type] = stream_id
-        if self._register_substream:
-            self._register_substream(stream_id, self)
-        log.info(f"new substream {stream_id} for {stream_type!r}")
-
-    def do_write(self, stream_id: int, data: bytes) -> None:
-        # process any pending substream allocations (we're on the asyncio loop now)
-        if self._pending_substreams:
-            pending = list(self._pending_substreams)
-            self._pending_substreams.clear()
-            log(f"allocating pending substreams: {pending}")
-            for stream_type in pending:
-                self._allocate_substream(stream_type)
-        if stream_id in self._substream_ids:
-            # raw QUIC stream — strip WS frame header, bypass H3
-            # WS framing is always added by make_wsframe_header (format thread)
-            # and stripped here (asyncio thread) to avoid a race between the
-            # framing decision and stream routing across threads
-            data = self._strip_ws_header(data)
-            log(f"substream {stream_id}: writing {len(data)} bytes")
-            self.connection._quic.send_stream_data(stream_id=stream_id, data=data, end_stream=self.closed)
-        else:
-            # main WebSocket stream — use H3 DATA frames
-            super().do_write(stream_id, data)
-
-    @staticmethod
-    def _strip_ws_header(data: bytes) -> bytes:
-        """Strip the WebSocket binary frame header from data."""
-        if len(data) < 2 or data[0] != 0x82:
-            return data
-        length_byte = data[1] & 0x7F
-        if length_byte <= 125:
-            return data[2:]
-        if length_byte == 126:
-            return data[4:]
-        # length_byte == 127
-        return data[10:]
 
     def is_audio_stream_ready(self) -> bool:
         """Check if the sound substream is allocated and ready for direct writes."""

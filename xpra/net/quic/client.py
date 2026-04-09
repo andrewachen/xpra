@@ -130,6 +130,7 @@ class WebSocketClient(QuicConnectionProtocol):
         self._http: HttpConnection | None = None
         self._websockets: dict[int, ClientWebSocketConnection] = {}
         self._substream_map: dict[int, ClientWebSocketConnection] = {}
+        self._substream_types: dict[int, str] = {}
         self._substream_buffers: dict[int, bytes] = {}
         self._tls_error: Exception | None = None
         if self._quic.configuration.alpn_protocols[0].startswith("hq-"):
@@ -173,6 +174,14 @@ class WebSocketClient(QuicConnectionProtocol):
         # already-registered substream: route directly
         websocket = self._substream_map.get(stream_id)
         if websocket:
+            # direct audio pipe: write sound data straight to the audio subprocess,
+            # bypassing _read_queue, parse thread, and _process_audio_data.
+            # TODO: port jitter histogram and AV sync feedback to the subprocess
+            writer = getattr(websocket, "_audio_pipe_writer", None)
+            if self._substream_types.get(stream_id) == "sound" and writer:
+                if writer.write(event.data):
+                    return True
+                websocket._audio_pipe_writer = None
             log(f"substream {stream_id}: {len(event.data)} bytes")
             websocket.put_raw_substream_data(event.data, stream_id)
             return True
@@ -199,8 +208,14 @@ class WebSocketClient(QuicConnectionProtocol):
             log.warn(f"Warning: no websocket for substream {stream_id}")
             return True
         self._substream_map[stream_id] = websocket
+        self._substream_types[stream_id] = stream_type
         log.info(f"new substream {stream_id} for {stream_type!r} packets")
         if remainder:
+            writer = getattr(websocket, "_audio_pipe_writer", None)
+            if stream_type == "sound" and writer:
+                if writer.write(remainder):
+                    return True
+                websocket._audio_pipe_writer = None
             log(f"substream {stream_id}: delivering {len(remainder)} bytes after header")
             websocket.put_raw_substream_data(remainder, stream_id)
         return True

@@ -47,6 +47,11 @@ class NetworkClient(StubClientMixin):
         p.set_compression_level(self.compression_level)
         p.enable_compressor_from_caps(caps)
         p.parse_remote_caps(caps)
+        # enable client->server QUIC substreams if the server supports them
+        if caps.boolget("quic.substreams"):
+            conn = getattr(p, "_conn", None)
+            if conn and hasattr(conn, "enable_substreams"):
+                conn.enable_substreams()
         self.server_compressors = caps.strtupleget("compressors")
         if BACKWARDS_COMPATIBLE:
             self.server_packet_types = caps.strtupleget("packet-types")

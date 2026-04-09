@@ -1,5 +1,6 @@
 # This file is part of Xpra.
 # Copyright (C) 2015 Antoine Martin <antoine@xpra.org>
+# Copyright (C) 2026 Netflix, Inc.
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
@@ -17,6 +18,7 @@ from xpra.audio.gstreamer_util import (
     can_decode, can_encode, get_muxers, get_demuxers, get_all_plugin_names,
 )
 from xpra.net.subprocess_wrapper import SubprocessCaller, SubprocessCallee, exec_kwargs, exec_env
+from xpra.util.child_reaper import get_child_reaper
 from xpra.platform.paths import get_audio_command
 from xpra.common import FULL_INFO
 from xpra.os_util import WIN32, OSX, POSIX, BITS, gi_import
@@ -143,6 +145,24 @@ class AudioRecord(AudioSubprocess):
         self.large_packets = ["new-buffer"]
 
 
+def _get_audio_pipe_fd() -> int:
+    """Get the audio pipe fd from the environment, handling platform differences.
+
+    On POSIX, the fd is passed directly via pass_fds.
+    On Windows, the native HANDLE is passed and converted to a CRT fd.
+    Returns -1 if no audio pipe is configured.
+    """
+    fd_str = os.environ.get("XPRA_AUDIO_PIPE_FD", "")
+    if fd_str:
+        return int(fd_str)
+    if WIN32:
+        handle_str = os.environ.get("XPRA_AUDIO_PIPE_HANDLE", "")
+        if handle_str:
+            import msvcrt
+            return msvcrt.open_osfhandle(int(handle_str), os.O_RDONLY)
+    return -1
+
+
 class AudioPlay(AudioSubprocess):
     """ wraps AudioSink as a subprocess """
 
@@ -150,6 +170,12 @@ class AudioPlay(AudioSubprocess):
         from xpra.audio.sink import AudioSink
         audio_pipeline = AudioSink(*pipeline_args)
         super().__init__(audio_pipeline, ["add_data", "set_av_sync_target"], [])
+        # direct audio pipe: bypass the main process parse thread
+        pipe_fd = _get_audio_pipe_fd()
+        if pipe_fd >= 0:
+            from xpra.audio.pipe_reader import AudioPipeReader
+            self.audio_pipe_reader = AudioPipeReader(pipe_fd, audio_pipeline.add_data)
+            log("audio pipe reader started on fd %s", pipe_fd)
 
 
 def run_audio(mode: str, error_cb: Callable, args: list[str]) -> int:
@@ -358,10 +384,11 @@ class SourceSubprocessWrapper(AudioSubprocessWrapper):
 
 class SinkSubprocessWrapper(AudioSubprocessWrapper):
 
-    def __init__(self, plugin, codec, volume, element_options):
+    def __init__(self, plugin, codec, volume, element_options, audio_pipe_fd: int = 0):
         super().__init__("audio playback")
         self.large_packets = ["add_data"]
         self.codec = codec
+        self.audio_pipe_fd = audio_pipe_fd
         self.command = get_full_audio_command() + [
             "_audio_play", "-", "-",
             plugin or "", format_element_options(element_options),
@@ -369,6 +396,36 @@ class SinkSubprocessWrapper(AudioSubprocessWrapper):
             str(volume),
         ]
         _add_debug_args(self.command)
+
+    def get_env(self) -> dict[str, str]:
+        env = super().get_env()
+        if self.audio_pipe_fd:
+            if WIN32:
+                import msvcrt
+                env["XPRA_AUDIO_PIPE_HANDLE"] = str(msvcrt.get_osfhandle(self.audio_pipe_fd))
+            else:
+                env["XPRA_AUDIO_PIPE_FD"] = str(self.audio_pipe_fd)
+        return env
+
+    def exec_subprocess(self) -> "subprocess.Popen":
+        import subprocess
+        kwargs = exec_kwargs()
+        env = self.get_env()
+        if self.audio_pipe_fd:
+            if WIN32:
+                import msvcrt
+                handle = msvcrt.get_osfhandle(self.audio_pipe_fd)
+                os.set_handle_inheritable(handle, True)
+                si = kwargs.get("startupinfo") or subprocess.STARTUPINFO()
+                si.lpAttributeList = {"handle_list": [handle]}
+                kwargs["startupinfo"] = si
+            else:
+                kwargs["pass_fds"] = (self.audio_pipe_fd,)
+        log("exec_subprocess() command=%s, env=%s, kwargs=%s", self.command, env, kwargs)
+        proc = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                env=env, start_new_session=True, **kwargs)
+        get_child_reaper().add_process(proc, self.description, self.command, True, True, callback=self.subprocess_exit)
+        return proc
 
     def add_data(self, data: bytes, metadata: dict, packet_metadata=()) -> None:
         if DEBUG_SOUND:
@@ -411,10 +468,10 @@ def start_sending_audio(plugins, audio_source_plugin: str, device: str, codec: s
     return None
 
 
-def start_receiving_audio(codec: str) -> SinkSubprocessWrapper:
-    log("start_receiving_audio(%s)", codec)
+def start_receiving_audio(codec: str, audio_pipe_fd: int = 0) -> SinkSubprocessWrapper:
+    log("start_receiving_audio(%s, audio_pipe_fd=%s)", codec, audio_pipe_fd)
     with log.trap_error("Error starting audio sink"):
-        return SinkSubprocessWrapper(None, codec, 1.0, {})
+        return SinkSubprocessWrapper(None, codec, 1.0, {}, audio_pipe_fd=audio_pipe_fd)
 
 
 def query_audio() -> typedict:

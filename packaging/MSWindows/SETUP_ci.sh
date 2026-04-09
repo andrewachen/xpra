@@ -59,7 +59,7 @@ for x in cryptography cffi pycparser numpy pillow appdirs paramiko comtypes neti
           setproctitle pyu2f ldap ldap3 bcrypt pynacl pyopengl pyopengl-accelerate \
           zeroconf certifi yaml py-cpuinfo coverage psutil oauthlib pysocks pyopenssl \
           importlib_resources pylsqpack aioquic service_identity pyvda watchdog \
-          pyqt6 wmi winloop pyglet; do
+          pyqt6 wmi pyglet; do
     $PACMAN ${XPKG}python-${x} || echo "Warning: python-${x} not available, skipping"
 done
 
@@ -87,6 +87,18 @@ $PACMAN openssl-devel || true
 for x in browser-cookie3 pyaes pbkdf2; do
     pip3 install "$x"
 done
+
+# winloop: fast asyncio event loop for Windows (QUIC transport).
+# MSYS2 packages 0.2.3 which fails on Python 3.14 (AbstractEventLoopPolicy removed).
+# Building 0.6.0 from source with MINGW_PREFIX set uses system libuv, but
+# clang 15+ treats int/pointer type mismatches in winloop's Cython code as hard errors.
+# These are harmless on Windows (HANDLE and int are same-width) so suppress them.
+$PACMAN ${XPKG}libuv || true
+CFLAGS_SAVE="$CFLAGS"
+export CFLAGS="$CFLAGS -Wno-error=int-conversion -Wno-error=incompatible-pointer-types"
+pip3 install "winloop>=0.3.0" --no-deps --no-build-isolation || \
+  echo "Warning: winloop build failed, falling back to ProactorEventLoop"
+export CFLAGS="$CFLAGS_SAVE"
 
 # verpatch: stamps version info into the installer EXE.
 # x86 binary — runs natively on x64, under emulation on ARM64.

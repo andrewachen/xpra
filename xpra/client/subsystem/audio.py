@@ -802,16 +802,20 @@ class AudioClient(StubClientMixin):
             ss.add_data(data, dict(metadata), packet_metadata)
         # measure transit time variation for adaptive jitter buffer:
         server_time = metadata.intget("time", 0)
+        if not server_time and not getattr(self, "_time_warned", False):
+            self._time_warned = True
+            avsynclog("av-sync: no 'time' in metadata, keys=%s", list(metadata.keys()))
         if server_time > 0:
             client_now = monotonic()
             if self._last_audio_arrival > 0 and self._last_audio_server_time > 0:
                 arrival_diff = (client_now - self._last_audio_arrival) * 1000
                 send_diff = server_time - self._last_audio_server_time
                 D = max(0.0, arrival_diff - send_diff)
-                # skip measurement after gaps > 2s and during bursts < 5ms:
-                # after an outage, burst packets arrive together with D≈0
-                # which would dilute the window and drop the target:
-                if 5 < arrival_diff < 2000:
+                # filter out gaps (> 2s = outage recovery) but accept all
+                # normal samples. Both arrival_diff and send_diff can be
+                # near-zero when the server's GLib loop is loaded (multi-client)
+                # because idle callbacks batch up:
+                if arrival_diff < 2000 and send_diff < 2000:
                     self._delay_histogram.add(D)
                     # record peaks immediately — checking only on the 200ms timer
                     # would miss spikes between ticks:

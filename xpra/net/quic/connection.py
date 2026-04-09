@@ -1,10 +1,11 @@
 # This file is part of Xpra.
 # Copyright (C) 2022 Antoine Martin <antoine@xpra.org>
+# Copyright (C) 2026 Netflix, Inc.
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
 import os
-from queue import SimpleQueue
+from queue import Empty, SimpleQueue
 from typing import Union, Any
 from collections.abc import Callable
 
@@ -93,6 +94,20 @@ class XpraQuicConnection(Connection):
         else:
             log.warn(f"Warning: unhandled websocket http event {event}")
 
+    def _close_dead_connection(self, reason: str = "write failed") -> None:
+        """Mark connection closed and unblock the read thread.
+
+        Called when a write to the QUIC stream fails, indicating the peer
+        is gone (e.g., SIGKILL). Putting empty bytes in the read queue
+        unblocks SocketProtocol's read thread, which triggers the full
+        xpra disconnect chain (stops audio sources, cleans up state).
+        """
+        if self.closed:
+            return
+        log.info("QUIC connection dead (%s): %s", reason, self)
+        self.closed = True
+        self.read_queue.put(b"")
+
     def close(self, code=QuicErrorCode.NO_ERROR, reason="closing") -> None:
         log(f"quic.close({code}, {reason})")
         if not self.closed:
@@ -134,7 +149,7 @@ class XpraQuicConnection(Connection):
             log(f"sending {packet_type!r} using datagram")
             return len(buf)
         stream_id = self.get_packet_stream_id(packet_type)
-        log("quic.stream_write(%s, %s) using stream id %s", Ellipsizer(buf), packet_type, stream_id)
+        log("%s.stream_write(%s, %s) using stream id %s", self, Ellipsizer(buf), packet_type, stream_id)
 
         def do_write() -> None:
             if self.closed:
@@ -143,11 +158,12 @@ class XpraQuicConnection(Connection):
             try:
                 self.do_write(stream_id, data)
                 self.transmit()
-            except AssertionError:
+            except Exception:
                 if self.closed:
                     log(f"connection is already closed, packet {packet_type} dropped")
                     return
-                raise
+                log(f"write failed for {packet_type} on stream {stream_id}", exc_info=True)
+                self._close_dead_connection(f"write failed: {packet_type}")
 
         get_threaded_loop().call(do_write)
         return len(buf)
@@ -235,4 +251,13 @@ class XpraQuicConnection(Connection):
     READ_TIMEOUT = 60
     def read(self, n: int) -> bytes:
         log("quic.read(%s)", n)
-        return self.read_queue.get()
+        while not self.closed:
+            try:
+                return self.read_queue.get(timeout=self.READ_TIMEOUT)
+            except Empty:
+                continue
+        # drain any remaining data before signaling EOF
+        try:
+            return self.read_queue.get_nowait()
+        except Empty:
+            return b""

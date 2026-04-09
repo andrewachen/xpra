@@ -800,25 +800,34 @@ class AudioClient(StubClientMixin):
         # (some packets (ie: sos, eos) only contain metadata)
         if data or packet_metadata:
             ss.add_data(data, dict(metadata), packet_metadata)
-        # measure transit time variation for adaptive jitter buffer:
-        server_time = metadata.intget("time", 0)
-        if server_time > 0:
+        # measure transit time variation for adaptive jitter buffer.
+        # prefer GStreamer PTS ("timestamp", nanoseconds) — set in the streaming
+        # thread at capture time, immune to GLib scheduling delays.
+        # fall back to "time" (monotonic ms from idle callback) if PTS unavailable:
+        pts_ns = metadata.intget("timestamp", -1)
+        if pts_ns > 0:
+            server_time_ms = pts_ns // 1_000_000
+        else:
+            server_time_ms = metadata.intget("time", 0)
+        if not server_time_ms and data and not getattr(self, "_ts_logged", False):
+            self._ts_logged = True
+            avsynclog("av-sync: no usable timestamp in metadata: %s",
+                      {k: type(v).__name__ + "=" + repr(v)[:60] for k, v in metadata.items()})
+        if server_time_ms > 0:
             client_now = monotonic()
             if self._last_audio_arrival > 0 and self._last_audio_server_time > 0:
                 arrival_diff = (client_now - self._last_audio_arrival) * 1000
-                send_diff = server_time - self._last_audio_server_time
+                send_diff = server_time_ms - self._last_audio_server_time
                 D = max(0.0, arrival_diff - send_diff)
-                # skip measurement after gaps > 2s and during bursts < 5ms:
-                # after an outage, burst packets arrive together with D≈0
-                # which would dilute the window and drop the target:
-                if 5 < arrival_diff < 2000:
+                # filter out gaps (> 2s = outage recovery):
+                if arrival_diff < 2000 and send_diff < 2000:
                     self._delay_histogram.add(D)
                     # record peaks immediately — checking only on the 200ms timer
                     # would miss spikes between ticks:
                     if D > 2 * max(self._cached_p97, 10):
                         self._delay_peaks.append((client_now, D))
             self._last_audio_arrival = client_now
-            self._last_audio_server_time = server_time
+            self._last_audio_server_time = server_time_ms
         if self.av_sync and self.server_av_sync:
             qinfo = typedict(ss.get_info()).dictget("queue")
             queue_used = typedict(qinfo or {}).intget("cur", -1)

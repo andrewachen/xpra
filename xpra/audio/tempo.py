@@ -339,6 +339,7 @@ try:
             self._channels = 0
             # cache last 2 buffers for priming — see sink.py for derivation:
             self._last_pcm = []
+            self._skip_next = False
             self.tempo_count = 0
             self.probe_errors = 0
             self.tempo_status = ""
@@ -346,16 +347,17 @@ try:
         def set_tempo(self, tempo: float) -> None:
             """Called from the timer thread to change playback speed.
 
-            Between non-1.0 speeds (e.g. 1.05→0.95): just changes the speed.
+            Between non-1.0 speeds (e.g. 1.025→0.975): just changes the speed.
             The overflow buffer may have ~20ms of data at the old speed, but
-            a ±5% mismatch over 20ms is imperceptible.
+            a ±2.5% mismatch over 20ms is imperceptible.
 
             Returning to 1.0: clears processor state so stale data doesn't
             leak into the next tempo event (which could be seconds later).
 
             Leaving 1.0: re-primes sonic with cached PCM so it has pitch
-            context for immediate output. Priming output is discarded
-            (not added to overflow) to avoid echoing already-played audio.
+            context for immediate output. Sets _skip_next so the first
+            buffer passes through unmodified (avoids transition pop from
+            the discontinuity between unprocessed and processed audio).
             """
             was_normal = self._tempo == 1.0
             self._tempo = tempo
@@ -367,6 +369,9 @@ try:
                 # transitioning from pass-through to active stretching:
                 self._processor.set_tempo(tempo)
                 self._prime_processor()
+                # skip modifying the next buffer to avoid a pop at the
+                # boundary between unprocessed and processed audio:
+                self._skip_next = True
             else:
                 self._processor.set_tempo(tempo)
 
@@ -409,6 +414,15 @@ try:
                 data = None
 
             if self._tempo == 1.0 or not data:
+                return Gst.FlowReturn.OK
+
+            # skip the first buffer after a 1.0→non-1.0 transition to
+            # avoid a pop at the unprocessed/processed audio boundary.
+            # feed the data to sonic (builds context) but don't write back:
+            if self._skip_next:
+                self._skip_next = False
+                if self._processor:
+                    self._processor.process_fixed_size(data)
                 return Gst.FlowReturn.OK
 
             if not self._processor:

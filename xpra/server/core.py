@@ -1493,6 +1493,11 @@ class ServerCore(ServerBaseClass):
         # use blocking sockets from now on:
         if not WIN32:
             set_socket_timeout(proto._conn, None)
+        # enable QUIC substreams if the client supports them:
+        conn = proto._conn
+        if c.boolget("quic.substreams") and hasattr(conn, "_use_substreams"):
+            conn._use_substreams = True
+            netlog.info("enabling QUIC substreams for this client")
 
     def make_hello(self, source) -> dict[str, Any]:
         now = time()

@@ -25,6 +25,11 @@ from xpra.audio.gstreamer_util import (
     MP3, CODEC_ORDER, QUEUE_LEAK,
     GST_QUEUE_NO_LEAK, MS_TO_NS, DEFAULT_SINK_PLUGIN_OPTIONS,
 )
+from xpra.audio.jitter import (
+    DelayHistogram,
+    JITTER_MIN_SAMPLES, JITTER_PERCENTILE, MAX_JITTER_BUFFER,
+    PEAK_HOLD_SECONDS,
+)
 from xpra.util.gobject import one_arg_signal
 from xpra.net.compression import decompress_by_name
 from xpra.scripts.config import InitExit
@@ -207,6 +212,14 @@ class AudioSink(AudioPipeline):
         # the raw level so tempo decisions account for prior adjustments
         # (prevents accelerate→expand→accelerate feedback loop):
         self._sample_memory: float = 0.0
+        # subprocess-local jitter measurement (for QUIC pipe bypass where
+        # _process_audio_data in the main process is skipped):
+        self._delay_histogram = DelayHistogram()
+        self._delay_peaks: deque[tuple[float, float]] = deque(maxlen=8)
+        self._cached_p97: float = 0.0
+        self._last_audio_arrival: float = 0.0
+        self._last_audio_server_time: int = 0
+        self._jitter_target: int = 0
         pipeline_els = [get_element_str("appsrc", get_default_appsrc_attributes())]
         if parser:
             pipeline_els.append(parser)
@@ -344,14 +357,31 @@ class AudioSink(AudioPipeline):
                     self.level_lock.release()
             if self.av_sync_timer == 0:
                 self.av_sync_timer = GLib.timeout_add(AV_SYNC_INTERVAL_MS, self._av_sync_tick)
-        elif self.av_sync_target == 0:
+        elif self.av_sync_target == 0 and self._jitter_target == 0:
             self.cancel_av_sync_timer()
+
+    def _compute_jitter_target(self) -> int:
+        """Compute buffer target from locally-measured jitter (p97 + peak hold)."""
+        hist = self._delay_histogram
+        if hist.count < JITTER_MIN_SAMPLES:
+            return 0
+        p97 = hist.percentile(JITTER_PERCENTILE)
+        self._cached_p97 = p97
+        jitter_ms = min(p97, MAX_JITTER_BUFFER)
+        now = monotonic()
+        active_peaks = [amp for t, amp in self._delay_peaks if now - t < PEAK_HOLD_SECONDS]
+        if active_peaks:
+            jitter_ms = max(jitter_ms, min(max(active_peaks), MAX_JITTER_BUFFER))
+        return max(20, int(jitter_ms)) if jitter_ms > 0 else 0
 
     def _av_sync_tick(self) -> bool:
         if not self.queue or self.queue_state == "starting":
             return True
+        # combine externally-set target (video decode) with local jitter:
+        self._jitter_target = self._compute_jitter_target()
+        effective_target = max(self.av_sync_target, self._jitter_target)
         current_max = self.queue.get_property("max-size-time") // MS_TO_NS
-        target_max = self.av_sync_target + AV_SYNC_HEADROOM_MS
+        target_max = effective_target + AV_SYNC_HEADROOM_MS
         # asymmetric: always grow (no dead band), only shrink past dead band:
         if current_max < target_max:
             new_max = target_max
@@ -364,8 +394,9 @@ class AudioSink(AudioPipeline):
         if new_max != current_max and self.level_lock.acquire(False):
             try:
                 self.queue.set_property("max-size-time", new_max * MS_TO_NS)
-                gstlog("av_sync_tick: target=%i, max=%i→%i",
-                       self.av_sync_target, current_max, new_max)
+                gstlog("av_sync_tick: target=%i (ext=%i, jitter=%i), max=%i→%i",
+                       effective_target, self.av_sync_target, self._jitter_target,
+                       current_max, new_max)
             finally:
                 self.level_lock.release()
         # tempo control via BaseTransform element (libsonic/SoundTouch):
@@ -379,19 +410,20 @@ class AudioSink(AudioPipeline):
             self._filtered_level = alpha * adjusted + (1 - alpha) * self._filtered_level
             level_ms = int(self._filtered_level)
             self.ticks_at_tempo += 1
-            new_tempo = compute_tempo(level_ms, self.av_sync_target,
+            new_tempo = compute_tempo(level_ms, effective_target,
                                       self.current_tempo, self.ticks_at_tempo)
-            lower = self.av_sync_target * 3 // 4
-            higher = max(self.av_sync_target, lower + 2 * OPUS_FRAME_MS)
-            gstlog("av_sync_tick: raw=%i, adj=%i, filt=%i, target=%i, limits=[%i,%i], "
-                   "tempo=%.3f, mem=%.1f, ticks=%i",
-                   raw_level, int(adjusted), level_ms, self.av_sync_target,
+            lower = effective_target * 3 // 4
+            higher = max(effective_target, lower + 2 * OPUS_FRAME_MS)
+            gstlog("av_sync_tick: raw=%i, adj=%i, filt=%i, target=%i (ext=%i, jitter=%i), "
+                   "limits=[%i,%i], tempo=%.3f, mem=%.1f, ticks=%i",
+                   raw_level, int(adjusted), level_ms,
+                   effective_target, self.av_sync_target, self._jitter_target,
                    lower, higher, self.current_tempo,
                    self._sample_memory, self.ticks_at_tempo)
             if new_tempo != self.current_tempo:
                 self.tempo_element.set_tempo(new_tempo)
                 gstlog("av_sync_tick: tempo %.3f→%.3f (filt=%i, target=%i)",
-                       self.current_tempo, new_tempo, level_ms, self.av_sync_target)
+                       self.current_tempo, new_tempo, level_ms, effective_target)
                 self.current_tempo = new_tempo
                 self.ticks_at_tempo = 0
                 # reset sample memory on tempo change — it tracked
@@ -587,6 +619,9 @@ class AudioSink(AudioPipeline):
                 "tempo_adjusted": getattr(self.tempo_element, "tempo_count", 0),
                 "probe_errors": getattr(self.tempo_element, "probe_errors", 0),
                 "padded": getattr(getattr(self.tempo_element, "_processor", None), "padding_count", 0),
+                "jitter_p97": self._cached_p97,
+                "jitter_target": self._jitter_target,
+                "jitter_samples": self._delay_histogram.count,
             }
         info["sink"] = self.get_element_properties(
             self.sink,
@@ -613,9 +648,37 @@ class AudioSink(AudioPipeline):
             return False
         return True
 
+    def _measure_jitter(self, metadata: dict) -> None:
+        """Measure inter-arrival jitter from packet timestamps.
+
+        Computes one-way delay variation D from server PTS intervals vs client
+        arrival intervals. D feeds into the exponential-decay histogram whose
+        p97 drives the adaptive buffer target and tempo control.
+        """
+        pts_ns = metadata.get("timestamp", -1)
+        if pts_ns > 0:
+            server_time_ms = pts_ns // 1_000_000
+        else:
+            server_time_ms = metadata.get("time", 0)
+        if not server_time_ms:
+            return
+        client_now = monotonic()
+        if self._last_audio_arrival > 0 and self._last_audio_server_time > 0:
+            arrival_diff = (client_now - self._last_audio_arrival) * 1000
+            send_diff = server_time_ms - self._last_audio_server_time
+            D = max(0.0, arrival_diff - send_diff)
+            # filter out gaps (> 2s = outage recovery):
+            if arrival_diff < 2000 and send_diff < 2000:
+                self._delay_histogram.add(D)
+                if D > 2 * max(self._cached_p97, 10):
+                    self._delay_peaks.append((client_now, D))
+        self._last_audio_arrival = client_now
+        self._last_audio_server_time = server_time_ms
+
     def add_data(self, data: bytes, metadata: dict, packet_metadata=()) -> None:
         if not self.can_push_buffer():
             return
+        self._measure_jitter(metadata)
         data = uncompress_data(data, metadata)
         for x in packet_metadata:
             self.do_add_data(x, {})
@@ -630,6 +693,9 @@ class AudioSink(AudioPipeline):
                 gstlog("add_data: refill=%s, level=%i, min=%i", self.refill, clt, qmin)
                 if 0 < qmin < clt:
                     self.refill = False
+        # start the av sync timer if jitter data is ready but no external target set it:
+        if self.av_sync_timer == 0 and self._delay_histogram.count >= JITTER_MIN_SAMPLES:
+            self.av_sync_timer = GLib.timeout_add(AV_SYNC_INTERVAL_MS, self._av_sync_tick)
         self.emit_info()
 
     def do_add_data(self, data, metadata: dict) -> bool:

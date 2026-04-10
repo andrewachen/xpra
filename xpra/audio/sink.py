@@ -399,7 +399,11 @@ class AudioSink(AudioPipeline):
                        current_max, new_max)
             finally:
                 self.level_lock.release()
-        # tempo control via BaseTransform element (libsonic/SoundTouch):
+        # tempo control via BaseTransform element (libsonic/SoundTouch).
+        # use p97 (current jitter) for tempo decisions, NOT peak-inflated target.
+        # peak hold keeps effective_target high for buffer SIZING (q.max stays large
+        # after a spike) but the buffer level is healthy once the spike passes —
+        # stretching for 5 seconds after a brief spike wastes quality for no benefit:
         if self.tempo_element:
             raw_level = self.queue.get_property("current-level-time") // MS_TO_NS
             # adjust for audio added/removed by prior stretching:
@@ -409,21 +413,27 @@ class AudioSink(AudioPipeline):
             alpha = 0.3 if adjusted < self._filtered_level else 0.1
             self._filtered_level = alpha * adjusted + (1 - alpha) * self._filtered_level
             level_ms = int(self._filtered_level)
+            # tempo target uses p97 only (no peak inflation):
+            p97_ms = max(20, int(min(self._cached_p97, MAX_JITTER_BUFFER))) \
+                if self._cached_p97 > 0 else 0
+            tempo_target = max(self.av_sync_target, p97_ms)
             self.ticks_at_tempo += 1
-            new_tempo = compute_tempo(level_ms, effective_target,
+            new_tempo = compute_tempo(level_ms, tempo_target,
                                       self.current_tempo, self.ticks_at_tempo)
-            lower = effective_target * 3 // 4
-            higher = max(effective_target, lower + 2 * OPUS_FRAME_MS)
-            gstlog("av_sync_tick: raw=%i, adj=%i, filt=%i, target=%i (ext=%i, jitter=%i), "
+            lower = tempo_target * 3 // 4
+            higher = max(tempo_target, lower + 2 * OPUS_FRAME_MS)
+            gstlog("av_sync_tick: raw=%i, adj=%i, filt=%i, "
+                   "buf_target=%i, tempo_target=%i (ext=%i, p97=%i, jitter=%i), "
                    "limits=[%i,%i], tempo=%.3f, mem=%.1f, ticks=%i",
                    raw_level, int(adjusted), level_ms,
-                   effective_target, self.av_sync_target, self._jitter_target,
+                   effective_target, tempo_target,
+                   self.av_sync_target, p97_ms, self._jitter_target,
                    lower, higher, self.current_tempo,
                    self._sample_memory, self.ticks_at_tempo)
             if new_tempo != self.current_tempo:
                 self.tempo_element.set_tempo(new_tempo)
-                gstlog("av_sync_tick: tempo %.3f→%.3f (filt=%i, target=%i)",
-                       self.current_tempo, new_tempo, level_ms, effective_target)
+                gstlog("av_sync_tick: tempo %.3f→%.3f (filt=%i, tempo_target=%i)",
+                       self.current_tempo, new_tempo, level_ms, tempo_target)
                 self.current_tempo = new_tempo
                 self.ticks_at_tempo = 0
                 # reset sample memory on tempo change — it tracked

@@ -156,6 +156,103 @@ class AudioClientReceiveTest(AudioClientTestUtil):
         assert self.mixin.audio_sink is None, "sink is still active: %s" % self.mixin.audio_sink
 
 
+class DeviceInvalidationTest(unittest.TestCase):
+    """Tests for WASAPI device invalidation detection and restart.
+
+    These tests construct AudioClient directly (no GStreamer pipeline)
+    to test the detection and backoff logic in isolation.
+    """
+
+    def setUp(self):
+        self.x = AudioClient()
+        self.x.exit_code = None
+        self.x.send = lambda *a: None
+        self.packets = []
+
+    def test_is_recoverable_audio_error(self):
+        from xpra.platform.audio import is_recoverable_audio_error
+        # on non-Win32, all errors are non-recoverable:
+        if not WIN32:
+            assert not is_recoverable_audio_error("AUDCLNT_E_DEVICE_INVALIDATED")
+            assert not is_recoverable_audio_error("88890004")
+            return
+        # on Win32, WASAPI device invalidation is recoverable:
+        assert is_recoverable_audio_error("AUDCLNT_E_DEVICE_INVALIDATED")
+        assert is_recoverable_audio_error("IAudioClient::GetCurrentPadding failed (88890004)")
+        assert is_recoverable_audio_error("something device_invalidated something")
+        assert not is_recoverable_audio_error("some other gstreamer error")
+        assert not is_recoverable_audio_error("")
+
+    def test_backoff_increases(self):
+        x = self.x
+        assert x._device_restart_delay == 0.0
+        d1 = x._next_device_restart_delay()
+        assert d1 == x.DEVICE_RESTART_INITIAL_MS
+        d2 = x._next_device_restart_delay()
+        assert d2 == d1 * 2
+        d3 = x._next_device_restart_delay()
+        assert d3 == d2 * 2
+
+    def test_backoff_caps_at_max(self):
+        x = self.x
+        for _ in range(20):
+            delay = x._next_device_restart_delay()
+        assert delay == x.DEVICE_RESTART_MAX_MS
+
+    def test_backoff_resets_on_ready(self):
+        x = self.x
+        x._next_device_restart_delay()
+        x._next_device_restart_delay()
+        assert x._device_restart_delay > 0
+        # simulate successful sink startup:
+        x._device_restart_delay = 0.0
+        d = x._next_device_restart_delay()
+        assert d == x.DEVICE_RESTART_INITIAL_MS
+
+    def _make_fake_sink(self):
+        fake_sink = AdHocStruct()
+        fake_sink.codec = "opus"
+        fake_sink.sequence = self.x.audio_sink_sequence
+        fake_sink.cleanup = lambda: None
+        self.x.audio_sink = fake_sink
+        self.x.speaker_enabled = True
+        return fake_sink
+
+    def test_device_error_sets_resume_flag(self):
+        if not WIN32:
+            return
+        x = self.x
+        fake_sink = self._make_fake_sink()
+        x.audio_sink_error(fake_sink, "IAudioClient::GetCurrentPadding failed (88890004)")
+        assert x.audio_sink is None, "sink should have been stopped"
+        assert x.audio_resume_restart, "resume flag should be set for device errors"
+
+    def test_non_device_error_does_not_set_resume_flag(self):
+        x = self.x
+        fake_sink = self._make_fake_sink()
+        x.audio_sink_error(fake_sink, "some other fatal error")
+        assert x.audio_sink is None, "sink should have been stopped"
+        assert not x.audio_resume_restart, "resume flag should not be set for non-device errors"
+
+    def test_device_changed_signal_restarts(self):
+        from xpra.os_util import gi_import
+        GLib = gi_import("GLib")
+        x = self.x
+        fake_sink = self._make_fake_sink()
+
+        scheduled = []
+        original_timeout_add = GLib.timeout_add
+        GLib.timeout_add = lambda delay, fn, *a: scheduled.append((delay, fn)) or 0
+
+        try:
+            x.audio_sink_error(fake_sink, "AUDIO_DEVICE_CHANGED")
+            assert x.audio_sink is None, "sink should have been stopped"
+            assert len(scheduled) == 1, "expected one timeout, got %s" % len(scheduled)
+            assert scheduled[0][1] == x.start_receiving_audio
+        finally:
+            GLib.timeout_add = original_timeout_add
+
+
 def main():
     if WIN32:
         return

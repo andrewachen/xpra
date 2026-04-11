@@ -1,5 +1,6 @@
 # This file is part of Xpra.
 # Copyright (C) 2010 Antoine Martin <antoine@xpra.org>
+# Copyright (C) 2026 Netflix, Inc.
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
@@ -383,7 +384,52 @@ class AudioConnection(StubClientConnection):
         sequence = audio_source.sequence
         if sequence >= 0:
             metadata["sequence"] = sequence
+        if self._try_audio_direct_write(packet_data):
+            return
         self.send(AUDIO_DATA_PACKET, *packet_data, synchronous=False, will_have_more=True)
+
+    _audio_direct_count = 0
+
+    def _try_audio_direct_write(self, packet_data: list) -> bool:
+        """Encode and write audio directly to the QUIC sound substream.
+
+        Bypasses the protocol format thread and write queue, eliminating
+        contention with draw packets. Returns True if the direct path was used.
+        """
+        p = self.protocol
+        if not p:
+            return False
+        conn = p._conn
+        if not getattr(conn, "_audio_direct_write", False):
+            return False
+        # only use the direct path once the sound substream is fully allocated;
+        # early packets (before allocation) must go through the normal send path
+        # which triggers the substream allocation in get_packet_stream_id()
+        is_ready = getattr(conn, "is_audio_stream_ready", None)
+        if not is_ready or not is_ready():
+            return False
+        write_fn = getattr(conn, "write_audio_direct", None)
+        if not write_fn:
+            return False
+        try:
+            from xpra.net.common import Packet
+            from xpra.net.protocol.header import pack_header
+            from xpra.net.asyncio.thread import get_threaded_loop
+            packet = Packet(AUDIO_DATA_PACKET, *packet_data)
+            chunks = p.encode(packet)
+            wire_data = bytearray()
+            for proto_flags, index, level, chunk_data in chunks:
+                wire_data.extend(pack_header(proto_flags, level, index, len(chunk_data)))
+                wire_data.extend(chunk_data)
+            data = bytes(wire_data)
+            get_threaded_loop().call(lambda: write_fn(data))
+            self._audio_direct_count += 1
+            if self._audio_direct_count == 1:
+                log.info("audio direct write: first packet (%d bytes wire) on %s", len(data), conn)
+            return True
+        except Exception:
+            log("audio direct write failed, using normal path", exc_info=True)
+            return False
 
     def stop_receiving_audio(self) -> None:
         ss = self.audio_sink

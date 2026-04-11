@@ -33,6 +33,7 @@ class ServerWebSocketConnection(XpraQuicConnection):
                  register_substream: Callable[[int, "ServerWebSocketConnection"], None] | None = None):
         super().__init__(connection, stream_id, transmit, "", 0, "wss", info=None, options=None)
         self.scope: dict = scope
+        self._audio_direct_write = False
         # configure server-specific substream packet types
         self._substream_packet_types = SUBSTREAM_PACKET_TYPES
         self._register_substream = register_substream
@@ -88,4 +89,24 @@ class ServerWebSocketConnection(XpraQuicConnection):
             self.send_headers(self.stream_id, headers={":status": code})
             self.transmit()
 
+    def is_audio_stream_ready(self) -> bool:
+        """Check if the sound substream is allocated and ready for direct writes."""
+        stream_id = self._packet_type_streams.get("sound")
+        return stream_id is not None and stream_id in self._substream_ids
 
+    def write_audio_direct(self, wire_data: bytes) -> None:
+        """Write pre-encoded audio data directly to the sound substream.
+
+        Called from the asyncio event loop. Bypasses the protocol format thread
+        and write queue, eliminating contention with draw packets.
+        """
+        stream_id = self._packet_type_streams.get("sound")
+        if not stream_id or stream_id not in self._substream_ids:
+            log.warn("Warning: write_audio_direct called but no sound substream allocated")
+            return
+        try:
+            self.connection._quic.send_stream_data(stream_id=stream_id, data=wire_data, end_stream=self.closed)
+            self.transmit()
+        except Exception:
+            log("write_audio_direct failed — QUIC connection dead", exc_info=True)
+            self._close_dead_connection("audio direct write failed")

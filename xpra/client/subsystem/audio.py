@@ -4,6 +4,7 @@
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
+import os
 from typing import Any
 from collections.abc import Callable, Sequence, Iterable
 
@@ -103,6 +104,7 @@ class AudioClient(StubClientMixin):
         self.queue_used_sent: int = 0
         self._av_sync_timer: int = 0
         self._pitch_logged: bool = False
+        self._audio_pipe_writer = None
         # duplicated from ServerInfo mixin:
         self._remote_machine_id = ""
 
@@ -472,6 +474,15 @@ class AudioClient(StubClientMixin):
         self.audio_sink_sequence += 1
         self.send(AUDIO_CONTROL_PACKET, "new-sequence", self.audio_sink_sequence)
         self.audio_sink = None
+        # close direct audio pipe if active
+        writer = getattr(self, "_audio_pipe_writer", None)
+        if writer:
+            self._audio_pipe_writer = None
+            conn = self._get_audio_pipe_conn()
+            if conn:
+                conn.set_audio_pipe_writer(None)
+            writer.close()
+            log("closed audio pipe writer")
         log("stop_receiving_audio(%s) calling %s", tell_server, ss.cleanup)
         ss.cleanup()
         log("stop_receiving_audio(%s) done", tell_server)
@@ -615,8 +626,19 @@ class AudioClient(StubClientMixin):
         try:
             log("starting %s audio sink", codec)
             from xpra.audio.wrapper import start_receiving_audio
-            ss = start_receiving_audio(codec)
+            # direct audio pipe: create pipe for QUIC substream bypass
+            audio_pipe_fd = 0
+            audio_pipe_writer = None
+            conn = self._get_audio_pipe_conn()
+            if conn:
+                read_fd, write_fd = os.pipe()
+                audio_pipe_fd = read_fd
+                log("created audio pipe: read_fd=%s, write_fd=%s", read_fd, write_fd)
+            ss = start_receiving_audio(codec, audio_pipe_fd=audio_pipe_fd)
             if not ss:
+                if audio_pipe_fd:
+                    os.close(audio_pipe_fd)
+                    os.close(write_fd)
                 return False
             ss.sequence = self.audio_sink_sequence
             self.audio_sink = ss
@@ -625,12 +647,36 @@ class AudioClient(StubClientMixin):
             ss.connect("exit", self.audio_sink_exit)
             ss.connect(CONNECTION_LOST, self.audio_process_stopped)
             ss.start()
+            # wire up the pipe after the subprocess has inherited the read end
+            if audio_pipe_fd and conn:
+                os.close(audio_pipe_fd)  # subprocess inherited it
+                audio_pipe_fd = 0  # prevent double-close in exception handler
+                from xpra.audio.pipe_reader import PipeWriter
+                audio_pipe_writer = PipeWriter(write_fd)
+                conn.set_audio_pipe_writer(audio_pipe_writer)
+                self._audio_pipe_writer = audio_pipe_writer
+                log("audio pipe wired: %s on %s", audio_pipe_writer, conn)
             log("%s audio sink started", codec)
             return True
         except Exception as e:
             log.error("Error: failed to start audio sink", exc_info=True)
+            if audio_pipe_writer:
+                audio_pipe_writer.close()
+            elif audio_pipe_fd:
+                os.close(audio_pipe_fd)
+                os.close(write_fd)
             self.audio_sink_error(self.audio_sink, e)
             return False
+
+    def _get_audio_pipe_conn(self):
+        """Return the QUIC connection if it supports direct audio pipe, or None."""
+        p = getattr(self, "_protocol", None)
+        if not p:
+            return None
+        conn = getattr(p, "_conn", None)
+        if conn and hasattr(conn, "_audio_pipe_writer"):
+            return conn
+        return None
 
     def new_audio_buffer(self, audio_source, data: bytes,
                          metadata: dict, packet_metadata: Sequence[SizedBuffer] = ()) -> None:

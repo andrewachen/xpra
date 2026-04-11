@@ -285,6 +285,8 @@ class ServerBase(ServerBaseClass):
         conn = proto._conn
         if c.boolget("quic.substreams") and hasattr(conn, "_use_substreams"):
             conn._use_substreams = True
+            if hasattr(conn, "_audio_direct_write"):
+                conn._audio_direct_write = True
             log.info("enabling QUIC substreams for this client")
 
         def drop_client(reason="unknown", *args) -> None:

@@ -54,6 +54,7 @@ class XpraQuicConnection(Connection):
         self.connection: HttpConnection = connection
         self.read_queue: SimpleQueue[bytes] = SimpleQueue()
         self._raw_read_cb: Callable[[bytes, int], None] | None = None
+        self._audio_pipe_writer = None
         self.stream_id: int = stream_id
         self.transmit: Callable[[], None] = transmit
         self.accepted: bool = False
@@ -328,8 +329,14 @@ class XpraQuicConnection(Connection):
         else:
             log.warn("Warning: raw substream data received but no parser callback set")
 
+    def set_audio_pipe_writer(self, writer) -> None:
+        """Set the PipeWriter for direct audio delivery to the audio subprocess."""
+        log("set_audio_pipe_writer(%s)", writer)
+        self._audio_pipe_writer = writer
+
     # check for closed connection every READ_TIMEOUT seconds
     READ_TIMEOUT = 60
+
     def read(self, n: int) -> bytes:
         log("quic.read(%s)", n)
         while not self.closed:

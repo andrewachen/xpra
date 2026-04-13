@@ -194,6 +194,8 @@ class XpraQuicConnection(Connection):
         else:
             # main WebSocket stream — use H3 DATA frames
             self.connection.send_data(stream_id=stream_id, data=data, end_stream=self.closed)
+        self.output_bytecount += len(data)
+        self.output_writecount += 1
 
     def get_packet_stream_id(self, packet_type: str) -> int:
         if self.closed or not self._use_substreams or not packet_type:
@@ -323,6 +325,7 @@ class XpraQuicConnection(Connection):
     def put_raw_substream_data(self, data: bytes, stream_id: int = 1) -> None:
         """Deliver substream data directly to the xpra packet parser, bypassing WebSocket framing."""
         log(f"put_raw_substream_data: {len(data)} bytes on stream {stream_id}")
+        self.input_bytecount += len(data)
         if self._raw_read_cb:
             self._raw_read_cb(data, stream_id)
         else:
@@ -334,11 +337,17 @@ class XpraQuicConnection(Connection):
         log("quic.read(%s)", n)
         while not self.closed:
             try:
-                return self.read_queue.get(timeout=self.READ_TIMEOUT)
+                data = self.read_queue.get(timeout=self.READ_TIMEOUT)
+                self.input_bytecount += len(data)
+                self.input_readcount += 1
+                return data
             except Empty:
                 continue
         # drain any remaining data before signaling EOF
         try:
-            return self.read_queue.get_nowait()
+            data = self.read_queue.get_nowait()
+            self.input_bytecount += len(data)
+            self.input_readcount += 1
+            return data
         except Empty:
             return b""

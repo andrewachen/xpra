@@ -167,9 +167,10 @@ cdef class Decoder:
         self.width = width
         self.height = height
         self.frames = 0
-        # Bit depth hint: 10 if server signals it, otherwise start at 8.
-        # The C layer's lazy_init will auto-detect from the actual bitstream header.
-        cdef int bit_depth = options.intget("bit-depth", 8)
+        # Bit depth: the C layer's lazy_init auto-detects from the bitstream
+        # header (DecodeHeader populates FrameInfo.FourCC and BitDepthLuma).
+        # Default to 8 here as a hint; the actual format is determined by the stream.
+        cdef int bit_depth = 8
         cdef VPLDecodeStatus status = vpl_decoder_create(&self.context, width, height, 1, bit_depth)
         if status == VPL_DEC_NOT_AVAILABLE:
             raise ImportError("oneVPL HEVC 444 decoder not available (no Intel GPU?)")

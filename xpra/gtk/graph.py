@@ -168,7 +168,7 @@ def make_graph_imagesurface(data, labels=None, width=320, height=200, title=None
     context.save()
     context.new_path()
     context.set_line_width(0.0)
-    context.rectangle(x_offset, y_offset, x_offset + w, y_offset + h)
+    context.rectangle(x_offset, y_offset, w, h)
     context.clip()
     context.set_line_width(1.5)
     for i, line_data in enumerate(data):

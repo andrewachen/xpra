@@ -36,6 +36,9 @@ $PACMAN ${XPKG}python ${XPKG}libnotify ${XPKG}gtk3
 # Media libraries (libspng present in 6.4 branch; harmless on master)
 $PACMAN ${XPKG}libspng ${XPKG}libavif ${XPKG}gst-plugins-good ${XPKG}gst-plugins-bad ${XPKG}gst-plugins-ugly
 
+# Intel oneVPL: HEVC 4:4:4 hardware decode on Intel GPUs
+$PACMAN ${XPKG}libvpl
+
 # libyuv: prefer the -git package, fall back to stable, skip if neither exists
 $PACMAN ${XPKG}libyuv-git || $PACMAN ${XPKG}libyuv || echo "Warning: libyuv not available, skipping"
 

@@ -90,14 +90,16 @@ done
 
 # winloop: fast asyncio event loop for Windows (QUIC transport).
 # MSYS2 packages 0.2.3 which fails on Python 3.14 (AbstractEventLoopPolicy removed).
-# Building 0.6.0 from source with MINGW_PREFIX set uses system libuv, but
+# Building from source with MINGW_PREFIX set uses system libuv, but
 # clang 15+ treats int/pointer type mismatches in winloop's Cython code as hard errors.
 # These are harmless on Windows (HANDLE and int are same-width) so suppress them.
+# Pin version: 0.6.2 crashes in create_datagram_endpoint on x64 Python 3.14.
+WINLOOP_VERSION="${XPRA_WINLOOP_VERSION:-0.6.0}"
 $PACMAN ${XPKG}libuv || true
 CFLAGS_SAVE="$CFLAGS"
 export CFLAGS="$CFLAGS -Wno-error=int-conversion -Wno-error=incompatible-pointer-types"
-pip3 install "winloop>=0.3.0" --no-deps --no-build-isolation || \
-  echo "Warning: winloop build failed, falling back to ProactorEventLoop"
+pip3 install "winloop==${WINLOOP_VERSION}" --no-deps --no-build-isolation || \
+  echo "Warning: winloop ${WINLOOP_VERSION} build failed, falling back to ProactorEventLoop"
 export CFLAGS="$CFLAGS_SAVE"
 
 # verpatch: stamps version info into the installer EXE.

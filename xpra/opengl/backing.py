@@ -95,7 +95,7 @@ OPENGL_SCALING_FILTER = os.environ.get("XPRA_OPENGL_SCALING_FILTER", "").lower()
 CURSOR_IDLE_TIMEOUT: int = envint("XPRA_CURSOR_IDLE_TIMEOUT", 6)
 
 PLANAR_FORMATS = (
-    "YUV420P", "YUV422P", "YUV444P", "NV12",
+    "YUV420P", "YUV422P", "YUV444P", "NV12", "AYUV", "Y410",
     "YUV420P16", "YUV422P16", "YUV444P16",
     "YUVA420P", "YUVA422P", "YUVA444P",
     "GBRP", "GBRP16",
@@ -118,6 +118,8 @@ PIXEL_INTERNAL_FORMAT: dict[str, Sequence[IntConstant]] = {
     # (meaning: up to 4 planes, 8 bits each)
     # override for formats that use 16 bit per channel:
     "NV12": (GL_LUMINANCE, GL_LUMINANCE_ALPHA),
+    "AYUV": (GL_RGBA8, ),
+    "Y410": (GL_RGB10_A2, ),
     "GBRP": (GL_LUMINANCE, GL_LUMINANCE, GL_LUMINANCE),  # invalid according to the spec! (only value that works)
     "GBRP16": (GL_R16, GL_R16, GL_R16),
     "YUV444P10": (GL_R16, GL_R16, GL_R16),
@@ -129,6 +131,8 @@ PIXEL_DATA_FORMAT: dict[str, Sequence[IntConstant]] = {
     # defaults to: (GL_RED, GL_RED, GL_RED, GL_RED))
     # (meaning: uploading one channel at a time)
     "NV12": (GL_LUMINANCE, GL_LUMINANCE_ALPHA),  # Y is one channel, UV contains two channels
+    "AYUV": (GL_RGBA, ),  # packed V,U,Y,A mapped to R,G,B,A
+    "Y410": (GL_RGBA, ),  # packed U10:Y10:V10:A2 mapped to R,G,B,A
 }
 PIXEL_UPLOAD_FORMAT: dict[str, Any] = {
     "r210": GL_UNSIGNED_INT_2_10_10_10_REV,
@@ -143,6 +147,8 @@ PIXEL_UPLOAD_FORMAT: dict[str, Any] = {
     "RGBX": GL_UNSIGNED_BYTE,
     # planar formats:
     "NV12": (GL_UNSIGNED_BYTE, GL_UNSIGNED_BYTE),
+    "AYUV": (GL_UNSIGNED_BYTE, ),
+    "Y410": (GL_UNSIGNED_INT_2_10_10_10_REV, ),
     "YUV420P": (GL_UNSIGNED_BYTE, GL_UNSIGNED_BYTE, GL_UNSIGNED_BYTE),
     "YUV422P": (GL_UNSIGNED_BYTE, GL_UNSIGNED_BYTE, GL_UNSIGNED_BYTE),
     "YUV444P": (GL_UNSIGNED_BYTE, GL_UNSIGNED_BYTE, GL_UNSIGNED_BYTE),
@@ -236,7 +242,7 @@ class GLWindowBackingBase(WindowBackingBase):
     """
 
     RGB_MODES: Sequence[str] = (
-        "YUV420P", "YUV422P", "YUV444P", "NV12",
+        "YUV420P", "YUV422P", "YUV444P", "NV12", "AYUV", "Y410",
         "GBRP", "BGRA", "BGRX", "RGBA", "RGBX",
         "RGB", "BGR",
     )
@@ -1476,7 +1482,7 @@ class GLWindowBackingBase(WindowBackingBase):
                                options: typedict, callbacks: PaintCallbacks) -> None:
         # overridden to handle YUV using shaders:
         pixel_format = img.get_pixel_format()
-        if pixel_format.startswith("YUV") or pixel_format == "NV12":
+        if pixel_format.startswith("YUV") or pixel_format in ("NV12", "AYUV", "Y410"):
             w = img.get_width()
             h = img.get_height()
             shader = f"{pixel_format}_to_RGB"
@@ -1707,7 +1713,7 @@ class GLWindowBackingBase(WindowBackingBase):
             if dformat == GL_LUMINANCE_ALPHA:
                 # uploading 2 components
                 w //= 2
-            elif dformat not in (GL_RED, GL_LUMINANCE):
+            elif dformat not in (GL_RED, GL_LUMINANCE, GL_RGBA):
                 raise RuntimeError(f"unexpected data format {dformat} for {pixel_format}")
             h = height // div_h
             if w == 0 or h == 0:
@@ -1751,7 +1757,7 @@ class GLWindowBackingBase(WindowBackingBase):
         if self.planar_pixel_format not in (
             "YUV420P", "YUV422P", "YUV444P",
             "YUVA420P", "YUVA422P", "YUVA444P",
-            "GBRP", "NV12", "GBRP16",
+            "GBRP", "NV12", "GBRP16", "AYUV", "Y410",
             "YUV420P16", "YUV422P16", "YUV444P16",
         ):
             # not ready to render yet
@@ -1789,16 +1795,19 @@ class GLWindowBackingBase(WindowBackingBase):
         if not program:
             raise RuntimeError(f"no {shader} found!")
         glUseProgram(program)
-        # NV12 shader uses "Y" and "UV" uniforms; other shaders use single-char names
-        # derived from the shader name (e.g. "YUV420P_to_RGB" → "Y", "U", "V")
-        nv12 = self.planar_pixel_format == "NV12"
-        nv12_names = ("Y", "UV")
+        # Shader uniform sampler names by format:
+        # NV12: "Y", "UV";  AYUV: "AYUV";  others: single chars from shader name ("Y","U","V",...)
+        uniform_names = {
+            "NV12": ("Y", "UV"),
+            "AYUV": ("AYUV", ),
+            "Y410": ("Y410", ),
+        }
+        names = uniform_names.get(self.planar_pixel_format)
         for texture, tex_index in textures:
             glActiveTexture(texture)
             glBindTexture(target, self.textures[tex_index])
-            # TEX_Y is 0, so effectively index==tex_index
             index = tex_index-TEX_Y
-            plane_name = nv12_names[index] if nv12 else shader[index:index + 1]
+            plane_name = names[index] if names else shader[index:index + 1]
             tex_loc = glGetUniformLocation(program, plane_name)
             glUniform1i(tex_loc, index)
 

@@ -84,6 +84,8 @@ def get_plane_name(pixel_format: str = "YUV420P", index: int = 0) -> str:
     bytespp = 2 if (pixel_format.endswith("P16") or pixel_format.endswith("P10")) else 1
     return ({
         "NV12": ("Y", "UV"),
+        "AYUV": ("AYUV", ),
+        "Y410": ("Y410", ),
     }.get(pixel_format, list(pixel_format))[index]) * bytespp
 
 
@@ -100,6 +102,8 @@ PIXEL_SUBSAMPLING : dict[str, Sequence[tuple[int, int]]] = {
     "YUV400P"   : ((1, 1), ),
     "GBRP"      : ((1, 1), (1, 1), (1, 1)),
     "GBRP9LE"   : ((1, 1), (1, 1), (1, 1)),
+    "AYUV"      : ((1, 1), ),
+    "Y410"      : ((1, 1), ),
 }
 
 

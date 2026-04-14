@@ -418,8 +418,10 @@ static VPLDecodeStatus extract_frame(VPLDecoder *dec, mfxFrameSurface1 *surface,
     int pitch = data->PitchLow + ((int)data->PitchHigh << 16);
 
     frame->stride = pitch;
-    frame->width = info->CropW ? info->CropW : info->Width;
-    frame->height = info->CropH ? info->CropH : info->Height;
+    /* Prefer the decoder's stored dimensions (from DecodeHeader CropW/CropH)
+       over the surface dimensions, which may be padded to alignment boundaries. */
+    frame->width = dec->width;
+    frame->height = dec->height;
     frame->format = dec->format;
     frame->us_map = (int)(t1 - t0);
 

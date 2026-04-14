@@ -1641,8 +1641,17 @@ cdef class Encoder:
         #update info:
         self.free_memory, self.total_memory = driver.mem_get_info()
 
+        # Report the encoded YUV colorspace, not the internal buffer format.
+        # nvenc's pixel_format can be BGRX/r210 (native input) or NV12/YUV444P (CSC'd input),
+        # but the decoder always receives a YUV stream.
+        if self.pixel_format in ("BGRX", "YUV444P"):
+            csc = "YUV444P"
+        elif self.pixel_format == "r210":
+            csc = "YUV444P"
+        else:
+            csc = CSC_ALIAS.get(self.pixel_format, self.pixel_format)
         client_options = {
-            "csc"       : CSC_ALIAS.get(self.pixel_format, self.pixel_format),
+            "csc"       : csc,
             "frame"     : int(self.frames),
             "pts"       : int(timestamp-self.first_frame_timestamp),
             "full-range" : full_range,

@@ -366,9 +366,14 @@ static VPLDecodeStatus lazy_init(VPLDecoder *dec, mfxBitstream *bs) {
         }
     }
 
-    /* update dimensions from parsed header */
-    dec->width = dec->param.mfx.FrameInfo.CropW;
-    dec->height = dec->param.mfx.FrameInfo.CropH;
+    /* Update dimensions from parsed header, but only if DecodeHeader provides
+       crop dimensions. The caller-supplied dimensions from vpl_decoder_create
+       are the actual content size; DecodeHeader's Width/Height are padded to
+       alignment boundaries (e.g. 1643→1664) and must not replace them. */
+    if (dec->param.mfx.FrameInfo.CropW > 0)
+        dec->width = dec->param.mfx.FrameInfo.CropW;
+    if (dec->param.mfx.FrameInfo.CropH > 0)
+        dec->height = dec->param.mfx.FrameInfo.CropH;
     if (dec->width == 0)
         dec->width = dec->param.mfx.FrameInfo.Width;
     if (dec->height == 0)

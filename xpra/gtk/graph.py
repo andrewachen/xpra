@@ -1,5 +1,6 @@
 # This file is part of Xpra.
 # Copyright (C) 2012 Antoine Martin <antoine@xpra.org>
+# Copyright (C) 2026 Netflix, Inc.
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
@@ -12,6 +13,8 @@ PangoCairo = gi_import("PangoCairo")
 Pango = gi_import("Pango")
 
 DEFAULT_COLOURS = ((0.8, 0, 0), (0, 0, 0.8), (0.1, 0.65, 0.1), (0, 0.6, 0.6), (0.1, 0.1, 0.1))
+DEFAULT_RIGHT_COLOURS = ((0.9, 0.55, 0.0),)
+MARKER_COLOUR = (0.85, 0.1, 0.1)
 
 
 def round_up_unit(i: int, rounding=10) -> int:
@@ -41,6 +44,10 @@ def make_graph_imagesurface(data, labels=None, width=320, height=200, title=None
                             min_y_scale=None, rounding=10,
                             start_x_offset=0.0,
                             colours=DEFAULT_COLOURS, dots=False, curves=True,
+                            right_data=None, right_labels=None,
+                            right_y_range=None, right_colours=None,
+                            right_steps=True,
+                            markers=None,
                             scale=1) -> cairo.ImageSurface:
     # print("make_graph_pixmap(%s, %s, %s, %s, %s, %s, %s, %s, %s)" % (data, labels, width, height, title,
     #                  show_y_scale, show_x_scale, min_y_scale, colours))
@@ -66,6 +73,9 @@ def make_graph_imagesurface(data, labels=None, width=320, height=200, title=None
                 max_y = max(max_y, y)
             x += 1
             max_x = max(max_x, x)
+    if right_data:
+        for line_data in right_data:
+            max_x = max(max_x, len(line_data))
     scale_x = max_x
     if min_y_scale is not None:
         max_y = max(max_y, min_y_scale)
@@ -81,6 +91,18 @@ def make_graph_imagesurface(data, labels=None, width=320, height=200, title=None
     _, label_h = _text_size(layout, "0")
     x_offset = max_label_w + 6
 
+    # right axis margin
+    has_right_axis = right_data and right_y_range
+    right_x_offset = 0
+    if has_right_axis:
+        r_min, r_max = right_y_range
+        max_right_label_w = 0
+        for i in range(0, 11):
+            rv = r_min + (r_max - r_min) * i / 10
+            lw, _ = _text_size(layout, f"{rv:.2f}")
+            max_right_label_w = max(max_right_label_w, lw)
+        right_x_offset = max_right_label_w + 6
+
     layout.set_font_description(title_font)
     _, title_h = _text_size(layout, "Ag")
     y_offset = title_h + 4
@@ -88,7 +110,7 @@ def make_graph_imagesurface(data, labels=None, width=320, height=200, title=None
     over = 2
     radius = 2
     # inner dimensions (used for graph only)
-    w = width - x_offset
+    w = width - x_offset - right_x_offset
     h = height - y_offset * 2
 
     # skip Y labels that would overlap
@@ -114,7 +136,7 @@ def make_graph_imagesurface(data, labels=None, width=320, height=200, title=None
     context.line_to(x_offset, height - y_offset + over)
     # show horizontal line:
     context.move_to(x_offset - over, height - y_offset)
-    context.line_to(width, height - y_offset)
+    context.line_to(x_offset + w + over, height - y_offset)
     # scales
     layout.set_font_description(axis_font)
     for i in range(0, 11):
@@ -132,7 +154,7 @@ def make_graph_imagesurface(data, labels=None, width=320, height=200, title=None
             context.set_source_rgb(0.5, 0.5, 0.5)
             context.set_line_width(0.5)
             context.set_dash([3.0, 3.0])
-            context.line_to(width, y)
+            context.line_to(x_offset + w, y)
             context.stroke()
             context.set_dash([])
             # label (skip if it would overlap)
@@ -156,6 +178,35 @@ def make_graph_imagesurface(data, labels=None, width=320, height=200, title=None
             context.move_to(x, height - y_offset - over)
             context.line_to(x, height - y_offset + over)
             context.stroke()
+    # right axis ticks and labels
+    if has_right_axis:
+        layout.set_font_description(axis_font)
+        r_min, r_max = right_y_range
+        right_edge = x_offset + w
+        # vertical axis line on the right
+        context.set_source_rgb(0, 0, 0)
+        context.set_line_width(1)
+        context.move_to(right_edge, y_offset - over)
+        context.line_to(right_edge, height - y_offset + over)
+        context.stroke()
+        r_colours = right_colours or DEFAULT_RIGHT_COLOURS
+        label_colour = r_colours[0]
+        for i in range(0, 11):
+            y = height - y_offset - h * i / 10
+            # tick mark
+            context.set_source_rgb(0, 0, 0)
+            context.set_line_width(1)
+            context.move_to(right_edge - over, y)
+            context.line_to(right_edge + over, y)
+            context.stroke()
+            # label (skip if it would overlap)
+            if i % y_label_step == 0:
+                rv = r_min + (r_max - r_min) * i / 10
+                unit = f"{rv:.2f}"
+                uw, uh = _text_size(layout, unit)
+                context.set_source_rgb(*label_colour)
+                context.move_to(right_edge + 4, y - uh / 2)
+                PangoCairo.show_layout(context, layout)
     # title:
     if title:
         context.set_source_rgb(0.2, 0.2, 0.2)
@@ -205,16 +256,82 @@ def make_graph_imagesurface(data, labels=None, width=320, height=200, title=None
                 last_v = v, x, y
             j += 1
         context.stroke()
+    # right-axis data (step function or lines, on the same clipped region)
+    if has_right_axis:
+        r_min, r_max = right_y_range
+        r_span = r_max - r_min
+        r_colours = right_colours or DEFAULT_RIGHT_COLOURS
+        for i, line_data in enumerate(right_data):
+            colour = r_colours[i % len(r_colours)]
+            context.set_source_rgb(*colour)
+            context.set_line_width(1.5)
+            j = 0
+            last_v = (-1, -1, -1)
+            for v in line_data:
+                x = x_offset + w * (j - start_x_offset) / (max(1, max_x - 2))
+                if v is not None:
+                    if r_span > 0:
+                        y = height - y_offset - h * (v - r_min) / r_span
+                    else:
+                        y = height - y_offset - h / 2
+                    if last_v != (-1, -1, -1):
+                        lx, ly = last_v[1:3]
+                        if right_steps:
+                            # step function: horizontal to new x, then vertical to new y
+                            context.line_to(x, ly)
+                            context.stroke()
+                            context.move_to(x, ly)
+                            context.line_to(x, y)
+                            context.stroke()
+                            context.move_to(x, y)
+                        else:
+                            context.line_to(x, y)
+                            context.stroke()
+                            context.move_to(x, y)
+                    else:
+                        context.move_to(x, y)
+                    last_v = v, x, y
+                j += 1
+            context.stroke()
+    # event markers (underrun/overrun triangles)
+    if markers:
+        marker_size = 6
+        context.set_line_width(1)
+        for idx, direction, count in markers:
+            mx = x_offset + w * (idx - start_x_offset) / (max(1, max_x - 2))
+            sz = min(marker_size + count - 1, 10)
+            context.set_source_rgb(*MARKER_COLOUR)
+            if direction == "down":
+                # downward triangle at bottom of graph
+                tip_y = height - y_offset - 2
+                context.move_to(mx - sz / 2, tip_y - sz)
+                context.line_to(mx + sz / 2, tip_y - sz)
+                context.line_to(mx, tip_y)
+                context.close_path()
+                context.fill()
+            elif direction == "up":
+                # upward triangle at top of graph
+                tip_y = y_offset + 2
+                context.move_to(mx - sz / 2, tip_y + sz)
+                context.line_to(mx + sz / 2, tip_y + sz)
+                context.line_to(mx, tip_y)
+                context.close_path()
+                context.fill()
     context.restore()
     # legend:
     layout.set_font_description(legend_font)
-    for i, line_data in enumerate(data):
-        if labels and len(labels) > i:
-            label = labels[i]
-            colour = colours[i % len(colours)]
-            context.set_source_rgb(*colour)
-            lw, lh = _text_size(layout, label)
-            context.move_to(x_offset / 2 + (width - x_offset) * i / len(labels), height - lh - 1)
-            PangoCairo.show_layout(context, layout)
-            context.stroke()
+    all_labels = list(labels or [])
+    all_colours = list(colours[:len(all_labels)])
+    if has_right_axis and right_labels:
+        r_colours = right_colours or DEFAULT_RIGHT_COLOURS
+        all_labels.extend(right_labels)
+        all_colours.extend(r_colours[:len(right_labels)])
+    total = len(all_labels)
+    for i, label in enumerate(all_labels):
+        colour = all_colours[i % len(all_colours)]
+        context.set_source_rgb(*colour)
+        lw, lh = _text_size(layout, label)
+        context.move_to(x_offset / 2 + (width - x_offset - right_x_offset) * i / total, height - lh - 1)
+        PangoCairo.show_layout(context, layout)
+        context.stroke()
     return surface

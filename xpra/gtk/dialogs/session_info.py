@@ -1,6 +1,7 @@
 # This file is part of Xpra.
 # Copyright (C) 2011 Antoine Martin <antoine@xpra.org>
 # Copyright (C) 2010 Nathaniel Smith <njs@pobox.com>
+# Copyright (C) 2026 Netflix, Inc.
 # Xpra is released under the terms of the GNU GPL v2, or, at your option, any
 # later version. See the file COPYING for details.
 
@@ -551,6 +552,11 @@ class SessionInfo(Gtk.Window):
                 self.audio_out_queue_cur.append(qlookup("cur"))
                 self.audio_out_queue_min.append(qlookup("min"))
                 self.audio_out_queue_max.append(qlookup("max"))
+                v = newdictlook(info, ("queue", "tempo"), 1.0)
+                tempo = float(v) if v is not None else 1.0
+                self.audio_out_tempo.append(tempo)
+                self.audio_out_underruns.append(qlookup("underruns"))
+                self.audio_out_overruns.append(qlookup("overruns"))
         return not self.is_closed
 
     def last_info(self) -> dict:
@@ -1290,6 +1296,9 @@ class SessionInfo(Gtk.Window):
         self.audio_out_queue_min = deque(maxlen=N_SAMPLES * 10 + 4)
         self.audio_out_queue_max = deque(maxlen=N_SAMPLES * 10 + 4)
         self.audio_out_queue_cur = deque(maxlen=N_SAMPLES * 10 + 4)
+        self.audio_out_tempo = deque(maxlen=N_SAMPLES * 10 + 4)
+        self.audio_out_underruns = deque(maxlen=N_SAMPLES * 10 + 4)
+        self.audio_out_overruns = deque(maxlen=N_SAMPLES * 10 + 4)
 
     def populate_graphs(self, *_args) -> bool:
         # older servers have 'batch' at top level,
@@ -1408,10 +1417,46 @@ class SessionInfo(Gtk.Window):
                 ),
                 N_SAMPLES * 10
             )
+            # tempo line on right axis + dropout event markers
+            tempo_values, tempo_labels = norm_lists(
+                ((self.audio_out_tempo, "Tempo"),),
+                N_SAMPLES * 10
+            )
+            markers = []
+            underruns = list(self.audio_out_underruns)
+            overruns = list(self.audio_out_overruns)
+            # norm_lists left-pads short series to N_SAMPLES*10 with None;
+            # offset marker indices so they align with the padded data
+            pad = max(0, N_SAMPLES * 10 - len(underruns))
+            for k in range(1, len(underruns)):
+                delta = underruns[k] - underruns[k - 1]
+                if delta > 0:
+                    markers.append((pad + k, "down", delta))
+            for k in range(1, len(overruns)):
+                delta = overruns[k] - overruns[k - 1]
+                if delta > 0:
+                    markers.append((pad + k, "up", delta))
+            # compute right axis range symmetric around 1.0 so the
+            # centerline never shifts when tempo changes
+            right_y_range = None
+            if tempo_values:
+                flat = [v for series in tempo_values for v in series if v is not None]
+                if flat:
+                    lo, hi = min(flat), max(flat)
+                    max_dev = max(1.0 - lo, hi - 1.0, 0)
+                    # double the deviation so the extreme sits at 25%/75%
+                    half_range = max(max_dev * 2, 0.05)
+                    right_y_range = (1.0 - half_range, 1.0 + half_range)
             surface = make_graph_imagesurface(queue_values, labels=queue_labels,
                                               width=w, height=h,
                                               title="Audio Buffer (ms)", min_y_scale=10, rounding=25,
                                               start_x_offset=start_x_offset,
+                                              right_data=tempo_values or None,
+                                              right_labels=tempo_labels or None,
+                                              right_y_range=right_y_range,
+                                              right_colours=((0.9, 0.55, 0.0),),
+                                              right_steps=True,
+                                              markers=markers or None,
                                               scale=scale)
             set_graph_surface(self.audio_queue_graph, surface)
         return True

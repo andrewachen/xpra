@@ -1647,7 +1647,7 @@ cdef class Encoder:
         if self.pixel_format in ("BGRX", "YUV444P"):
             csc = "YUV444P"
         elif self.pixel_format == "r210":
-            csc = "YUV444P"
+            csc = "GBRP10"
         else:
             csc = CSC_ALIAS.get(self.pixel_format, self.pixel_format)
         client_options = {

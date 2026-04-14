@@ -39,6 +39,7 @@ docker run --rm \
         cp -a /xpra /tmp/build 2>/dev/null || true
         cd /tmp/build
         CFLAGS="-march=native -O2" python3 setup.py build_ext \
+            -j "$(nproc)" \
             --with-nvidia \
             --with-nvenc \
             --without-cuda_kernels \

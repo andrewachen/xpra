@@ -235,6 +235,8 @@ cdef class Decoder:
         cdef const uint8_t *src
         cdef int src_len
         cdef int new_w, new_h
+        cdef uint8_t *dst
+        cdef int y_row
 
         assert self.context != NULL, "decoder is closed"
 
@@ -278,8 +280,7 @@ cdef class Decoder:
         else:
             # stride != width*bpp due to padding; must compact rows
             buf = bytearray(row_bytes * h)
-            cdef uint8_t *dst = <uint8_t *> buf
-            cdef int y_row
+            dst = <uint8_t *> buf
             with nogil:
                 for y_row in range(h):
                     memcpy(dst + y_row * row_bytes,

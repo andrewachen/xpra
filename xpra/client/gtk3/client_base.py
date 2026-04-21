@@ -1075,9 +1075,7 @@ class GTKXpraClient(GObjectXpraClient, UIXpraClient):
             # trays don't have a gdk window
             if gdkwin:
                 self._cursors[w] = cursor_data
-                update_fn = getattr(w, "_update_cursor_subclass", None)
-                if update_fn is None or not update_fn(cursor):
-                    gdkwin.set_cursor(cursor)
+                gdkwin.set_cursor(cursor)
 
     def process_ui_capabilities(self, caps: typedict) -> None:
         UIXpraClient.process_ui_capabilities(self, caps)

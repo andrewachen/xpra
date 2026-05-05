@@ -357,9 +357,11 @@ class WindowSource(WindowIconSource):
             self.window_signal_handlers.append(sid)
 
         if self.has_alpha and BROWSER_ALPHA_FIX and not self.is_OR:
-            # remove alpha from 'NORMAL' browser windows
+            # remove alpha from 'NORMAL' browser- or text-classified windows
             # of a size greater than 200x200:
-            if self.content_type.find("browser") >= 0 and "NORMAL" in self.window_type and ww >= 200 and wh >= 200:
+            ct = self.content_type
+            ok_type = ct.find("browser") >= 0 or ct.find("text") >= 0
+            if ok_type and "NORMAL" in self.window_type and ww >= 200 and wh >= 200:
                 self.has_alpha = False
 
         # will be overridden by update_quality() and update_speed() called from update_encoding_selection()

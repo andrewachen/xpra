@@ -42,7 +42,8 @@ jobs:
         run: git config --global --add safe.directory *
 
       # Install base MSYS2 and set up the shell wrapper.
-      # update: false — SETUP_ci.sh handles pacman -Syu on cache miss.
+      # update: false — system upgrade is handled below in two passes on
+      # cache miss only, so cache hits stay fast.
       - name: Set up MSYS2
         uses: msys2/setup-msys2@v2
         with:
@@ -64,6 +65,22 @@ jobs:
         with:
           path: ${{ runner.temp }}\msys64
           key: msys2-${{ matrix.msystem }}-${{ steps.date.outputs.date }}-${{ hashFiles('packaging/MSWindows/SETUP_ci.sh') }}
+
+      # Two-pass system upgrade on cache miss. When MSYS2 publishes new
+      # `pacman` or `msys2-runtime` packages, `pacman -Syuu` terminates the
+      # shell mid-upgrade (pacman can't replace its own running binary or the
+      # currently-loaded runtime DLL). The first pass swallows that exit code;
+      # the second pass runs in a fresh shell and completes any leftover
+      # package updates. On days without a runtime bump both passes are
+      # near-no-ops.
+      - name: Update MSYS2 runtime (may restart shell)
+        if: steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: pacman --noconfirm -Syuu
+
+      - name: Complete MSYS2 system upgrade
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: pacman --noconfirm -Syuu
 
       - name: Install dependencies
         if: steps.cache.outputs.cache-hit != 'true'

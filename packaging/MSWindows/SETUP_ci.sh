@@ -26,9 +26,9 @@ else
 fi
 echo "Compiler flags: CFLAGS=${CFLAGS}"
 
-# Full system update before installing packages.
-# The workflow caches the entire msys64 prefix, so this only runs on cache miss.
-pacman --noconfirm -Syu
+# System upgrade is handled by the workflow's two-pass `pacman -Syuu` steps
+# (windows.yml) which survive MSYS2 runtime/pacman self-upgrades that kill the
+# shell mid-update. Reaching this script means the upgrade is already done.
 
 # Core: Python runtime, GTK3 UI toolkit, desktop notifications
 $PACMAN ${XPKG}python ${XPKG}libnotify ${XPKG}gtk3

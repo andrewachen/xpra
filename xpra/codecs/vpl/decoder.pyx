@@ -260,14 +260,16 @@ def get_specs() -> Sequence[VideoSpec]:
     # frame extraction in the C layer and a broader startup probe; the MF
     # decoder has been reliable enough that the added complexity isn't justified.
     #
-    # Both 8-bit (AYUV) and 10-bit (Y410) share the same input colorspace
-    # because the bit depth is implicit in the HEVC stream profile.
-    # The decoder auto-detects AYUV vs Y410 from the bitstream header.
+    # 8-bit only for now. Y410 (10-bit) is deliberately not advertised:
+    # only YUV444P is registered at init time, and the pool reset path hardcodes
+    # bit_depth=8, so a 10-bit stream would be reconfigured against AYUV surfaces.
+    # Plumb bit_depth through the Cython wrapper and partition the pool key on
+    # bd before adding "Y410" here.
     return (
         VideoSpec(
             encoding="h265",
             input_colorspace="YUV444P",
-            output_colorspaces=("AYUV", "Y410"),
+            output_colorspaces=("AYUV", ),
             has_lossless_mode=False,
             codec_class=Decoder,
             codec_type=get_type(),

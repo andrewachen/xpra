@@ -316,19 +316,15 @@ cdef class Decoder:
         cdef VPLDecodeStatus status
         if VPL_POOL_ENABLED:
             from xpra.codecs.vpl import pool as vpl_pool
-            try:
-                self._slot = vpl_pool.acquire(width, height)
-            except VPLNotAvailable as e:
-                # Preserve legacy ImportError semantics so the codec
-                # dispatcher can fall through to the next decoder.
-                raise ImportError(str(e))
+            # VPLNotAvailable inherits from RuntimeError, which
+            # paint_with_video_decoder catches to fall through to the
+            # next decoder in the dispatcher loop.
+            self._slot = vpl_pool.acquire(width, height)
             self.context = <VPLDecoder*><size_t>self._slot.handle
         else:
             # bit_depth=8 is just a hint; lazy_init re-derives the real
             # value from the bitstream on first decode.
             status = vpl_decoder_create(&self.context, width, height, 1, 8)
-            if status == VPL_DEC_NOT_AVAILABLE:
-                raise ImportError("oneVPL HEVC 444 decoder not available (no Intel GPU?)")
             if status != VPL_DEC_OK:
                 raise RuntimeError("failed to create VPL decoder (%dx%d): %s" % (
                     width, height, vpl_decode_status_str(status).decode("latin-1")))

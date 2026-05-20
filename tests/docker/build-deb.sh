@@ -1,0 +1,185 @@
+#!/bin/bash
+# This file is part of Xpra.
+# Copyright (C) 2026 Netflix, Inc.
+# Xpra is released under the terms of the GNU GPL v2, or, at your option, any
+# later version. See the file COPYING for details.
+# ABOUTME: Builds xpra .deb packages in Docker against a persistent host-side cache for incremental rebuilds.
+# ABOUTME: Usage: ./tests/docker/build-deb.sh [--deploy]
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+IMAGE_NAME="xpra-deb-build"
+CACHE_DIR="$REPO_DIR/build-deb-cache"
+OUT_DIR="$REPO_DIR/build-deb-out"
+DEPLOY=false
+
+# Only these .deb files get copied to OUT_DIR. Headless server install set per
+# memory + Andrew's "linux client pointless" decision. Adjust as needed.
+KEEP_DEBS=(
+    xpra
+    xpra-common
+    xpra-server
+    xpra-x11
+    xpra-codecs
+    xpra-codecs-nvidia
+    xpra-audio
+    xpra-audio-server
+    # xpra-client + xpra-client-gtk3 are pulled in by the xpra meta-package's
+    # Depends, so they must be installed at the same version. They're small
+    # and harmless on a headless server.
+    xpra-client
+    xpra-client-gtk3
+)
+
+if [ "$1" = "--deploy" ]; then
+    DEPLOY=true
+fi
+
+NVENC_IMAGE="xpra-nvenc-build"
+# Auto-build base image if missing. To force a rebuild (e.g. after editing
+# the Dockerfile), run: docker rmi $NVENC_IMAGE
+if ! docker image inspect "$NVENC_IMAGE" >/dev/null 2>&1; then
+    echo "Building $NVENC_IMAGE image (one-time, ~5-8 min)..."
+    docker build -t "$NVENC_IMAGE" -f "$SCRIPT_DIR/Dockerfile.nvenc" "$SCRIPT_DIR"
+fi
+
+# Auto-build deb image if missing. To force a rebuild: docker rmi $IMAGE_NAME
+if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+    echo "Building $IMAGE_NAME image (one-time, ~2-3 min)..."
+    docker build -t "$IMAGE_NAME" -f "$SCRIPT_DIR/Dockerfile.deb" "$SCRIPT_DIR"
+fi
+
+GIT_SHA=$(git -C "$REPO_DIR" rev-parse --short HEAD)
+GIT_BRANCH=$(git -C "$REPO_DIR" branch --show-current)
+GIT_LOCAL_MODS=$(git -C "$REPO_DIR" diff --shortstat 2>/dev/null | wc -l)
+DIST=$(lsb_release -cs)
+# Sorts above xpra-org's "6.4.5-r0-1" naming so apt prefers our build.
+VERSION="6.4.5-achen-${GIT_SHA}~${DIST}"
+
+mkdir -p "$CACHE_DIR" "$OUT_DIR"
+rm -f "$OUT_DIR"/*.deb "$OUT_DIR"/*.buildinfo "$OUT_DIR"/*.changes 2>/dev/null || true
+
+echo "Building xpra .deb (version: $VERSION)"
+echo "Cache dir: $CACHE_DIR  (delete to force clean rebuild)"
+echo ""
+
+docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    -v "$REPO_DIR:/xpra:ro" \
+    -v "$CACHE_DIR:/cache" \
+    -v "$OUT_DIR:/out" \
+    -e GIT_SHA="$GIT_SHA" \
+    -e GIT_BRANCH="$GIT_BRANCH" \
+    -e GIT_LOCAL_MODS="$GIT_LOCAL_MODS" \
+    -e VERSION="$VERSION" \
+    "$IMAGE_NAME" \
+    bash -c '
+        set -e
+        SRC=/cache/xpra-src
+        mkdir -p "$SRC"
+
+        # Sync source from read-only mount into cache. --delete handles file
+        # removals (renames, deletes). --checksum compares file content (md5)
+        # instead of size+mtime, so cache .pyx files keep their old mtimes when
+        # content is unchanged. Without this, a fresh git checkout updates
+        # source mtimes to "now" and Cython recompiles every module even
+        # though no content changed. Cost: ~1-2s to checksum ~50MB of source;
+        # win: 5-10 min saved on incremental rebuilds.
+        rsync -a --delete --checksum \
+            --exclude=".git/" \
+            --exclude=".claude/" \
+            --exclude=".codex-reviews/" \
+            --exclude="build-deb-cache/" \
+            --exclude="build-deb-out/" \
+            --exclude="build-nvenc-out/" \
+            --exclude="__pycache__/" \
+            --exclude="test-file-auth-*" \
+            --exclude="*.deb" \
+            --exclude="*.buildinfo" \
+            --exclude="*.changes" \
+            /xpra/ "$SRC/"
+
+        cd "$SRC"
+
+        # Write src_info.py with branch/commit captured from the host before
+        # rsync stripped .git/. setup.py only writes this file if it does not
+        # already exist (see fs/bin/add_build_info.py check_file guard), so
+        # this overrides what would otherwise be "unknown" or a stale value
+        # cached from a prior build. End result: `xpra info build.branch`
+        # reflects the actual built tree.
+        cat > xpra/src_info.py <<EOF
+BRANCH = "${GIT_BRANCH}"
+COMMIT = "${GIT_SHA}"
+LOCAL_MODIFICATIONS = ${GIT_LOCAL_MODS:-0}
+REVISION = 0
+EOF
+
+        # Drop --with-qt6_client (Andrew does not use the Qt6 client).
+        # Disable nvfbc/nvdec/nvjpeg/cuda_kernels — only nvenc is wanted, and
+        # nvfbc/nvjpeg need libnvidia-fbc1 which we do not stub.
+        # idempotent: re-running on a clean cache produces the same file.
+        cp debian/rules debian/rules.orig 2>/dev/null || true
+        cp debian/rules.orig debian/rules 2>/dev/null || true
+        sed -i \
+            -e "s/ --with-qt6_client//" \
+            -e "s|^BUILDOPTS := \$(EXTRA_BUILDOPTS).*|BUILDOPTS := \$(EXTRA_BUILDOPTS) --without-qt6_client --without-pyglet_client --without-amf --without-nvdec --without-nvfbc --without-nvjpeg_encoder --without-nvjpeg_decoder --without-cuda_kernels --without-docs --without-pandoc_lua|" \
+            debian/rules
+
+        # --without-docs skips generating /usr/share/doc/xpra/ but
+        # xpra-common.files still references it, which fails dh_movefiles.
+        # Strip the doc directory entry from the package manifest.
+        sed -i "\|usr/share/doc/xpra/|d" debian/xpra-common.files
+
+        # Prepend a changelog entry so the resulting .deb gets our version
+        # string. Writing the entry directly (vs dch) avoids needing tty/env.
+        TS=$(date -R)
+        NEW_ENTRY="xpra (${VERSION}) UNRELEASED; urgency=low\n\n  * Build from v6.4.3-achen ${GIT_SHA}\n\n -- ${DEBFULLNAME} <${DEBEMAIL}>  ${TS}\n\n"
+        printf "$NEW_ENTRY" > /tmp/changelog.new
+        cat debian/changelog >> /tmp/changelog.new
+        mv /tmp/changelog.new debian/changelog
+
+        # Build binary packages only (-b), no source archive.
+        # -us -uc: skip signing source / changes (no GPG key in container).
+        # -d: skip checking Build-Depends (we baked them into the image).
+        # -nc: skip the pre-build clean (preserves build/temp.* .o files for
+        #      incremental rebuilds). Without this, dh_auto_clean runs
+        #      `setup.py clean` which wipes object files and forces full
+        #      gcc recompilation even when nothing changed.
+        # -j$(nproc): parallel build across all cores.
+        debuild -nc -b -us -uc -d -j$(nproc)
+
+        # Copy only the .deb files Andrew actually installs. Quiet on misses
+        # so an empty xpra-client-qt6 stanza does not break the script.
+        cd ..
+        for pkg in '"${KEEP_DEBS[*]}"'; do
+            for f in "${pkg}"_*.deb; do
+                if [ -f "$f" ]; then
+                    cp -v "$f" /out/
+                fi
+            done
+        done
+    '
+
+echo ""
+echo "Output in: $OUT_DIR/"
+ls -la "$OUT_DIR"/*.deb 2>/dev/null | wc -l | xargs echo "Packages built:"
+
+# Always print the install command so you can install later without re-running
+# the build. Use the actual filenames so it works even if KEEP_DEBS changes.
+DEB_FILES=("$OUT_DIR"/*.deb)
+if [ -e "${DEB_FILES[0]}" ]; then
+    echo ""
+    echo "To install:"
+    echo "  sudo dpkg -i ${DEB_FILES[*]}"
+fi
+
+if [ "$DEPLOY" = true ]; then
+    echo ""
+    echo "Installing with sudo dpkg -i..."
+    sudo dpkg -i "$OUT_DIR"/*.deb
+    echo ""
+    echo "Installed versions:"
+    dpkg-query -W -f='${Package} ${Version}\n' "${KEEP_DEBS[@]}" 2>/dev/null
+fi

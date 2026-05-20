@@ -18,10 +18,11 @@ if [ "$1" = "--deploy" ]; then
     DEPLOY=true
 fi
 
+# Auto-build image if missing. To force a rebuild (e.g. after editing the
+# Dockerfile), run: docker rmi $IMAGE_NAME
 if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-    echo "Docker image '$IMAGE_NAME' not found. Build it first with:" >&2
-    echo "  docker build -t $IMAGE_NAME -f $SCRIPT_DIR/Dockerfile.nvenc $SCRIPT_DIR" >&2
-    exit 1
+    echo "Building $IMAGE_NAME image (one-time, ~5-8 min)..."
+    docker build -t "$IMAGE_NAME" -f "$SCRIPT_DIR/Dockerfile.nvenc" "$SCRIPT_DIR"
 fi
 
 rm -rf "$OUT_DIR"

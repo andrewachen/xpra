@@ -1,0 +1,33 @@
+# This file is part of Xpra.
+# Copyright (C) 2026 Netflix, Inc.
+# Xpra is released under the terms of the GNU GPL v2, or, at your option, any
+# later version. See the file COPYING for details.
+# ABOUTME: Ubuntu 24.04 image for building xpra .deb packages via debuild.
+# ABOUTME: Layers on top of xpra-nvenc-build to inherit codec dev libs and the libnvidia-encode stub.
+
+FROM xpra-nvenc-build
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Packaging toolchain + the rest of xpra's debian/control Build-Depends
+# that aren't already in the nvenc image (debhelper et al + X11/GStreamer/
+# Python build deps the codec-only image doesn't need).
+RUN apt-get update && apt-get -y install --no-install-recommends \
+    debhelper devscripts fakeroot equivs dh-python lintian \
+    rsync python3-setuptools \
+    libdav1d-dev libdrm-dev libspng-dev libwayland-dev libproc2-dev \
+    xserver-xorg-dev xutils-dev xserver-xorg-video-dummy \
+    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+    python3-gi python3-gi-cairo \
+    python3-paramiko python3-aioquic \
+    python3-netifaces python3-dbus python3-cryptography \
+    python3-xdg python3-setproctitle \
+    lsb-release xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# debuild reads these to populate the changelog Maintainer line.
+# Override at runtime with `-e DEBFULLNAME=... -e DEBEMAIL=...` if needed.
+ENV DEBFULLNAME="Andrew Chen"
+ENV DEBEMAIL="achen.code@gmail.com"
+
+WORKDIR /cache

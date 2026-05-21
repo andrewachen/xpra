@@ -34,7 +34,7 @@ from OpenGL.GL import (
     glViewport,
     glGenTextures, glDeleteTextures,
     glDisable,
-    glBindTexture, glPixelStorei, glFlush,
+    glBindTexture, glPixelStorei, glFlush, glFinish,
     glBindBuffer, glGenBuffers, glBufferData, glDeleteBuffers,
     glTexParameteri,
     glTexImage2D,
@@ -85,6 +85,12 @@ FORCE_VIDEO_PIXEL_FORMAT = os.environ.get("XPRA_FORCE_VIDEO_PIXEL_FORMAT", "")
 DRAW_REFRESH = envbool("XPRA_OPENGL_DRAW_REFRESH", True)
 FBO_RESIZE = envbool("XPRA_OPENGL_FBO_RESIZE", True)
 FBO_RESIZE_DELAY = envint("XPRA_OPENGL_FBO_RESIZE_DELAY", -1)
+# When set, forces a glFinish() at three commit points in resize_fbo.
+# Workaround for drivers that fail to honor in-order visibility across
+# the swap-and-reinit dance, producing a stretched + black-bar artifact
+# after a fast resize. Opt-in via env var; off by default.
+# See https://gitlab.freedesktop.org/mesa/mesa/-/issues/15513
+RESIZE_GLFINISH = envbool("XPRA_OPENGL_RESIZE_GLFINISH", False)
 CONTEXT_REINIT = envbool("XPRA_OPENGL_CONTEXT_REINIT", False)
 NVJPEG = envbool("XPRA_OPENGL_NVJPEG", True)
 NVDEC = envbool("XPRA_OPENGL_NVDEC", False)
@@ -408,8 +414,18 @@ class GLWindowBackingBase(WindowBackingBase):
         else:
             glClearColor(1, 1, 1, 1)
         glClear(GL_COLOR_BUFFER_BIT)
+        # Some drivers defer texture storage allocation across the
+        # swap-and-reinit dance below and end up sampling the
+        # previous-size resource, producing a stretched + black-bar
+        # artifact after a fast resize. Optional glFinish() forces
+        # the new-size allocation to commit before subsequent use.
+        # See https://gitlab.freedesktop.org/mesa/mesa/-/issues/15513
+        if RESIZE_GLFINISH:
+            glFinish()
         # copy offscreen to new tmp:
         self.copy_fbo(w, h, sx, sy, dx, dy)
+        if RESIZE_GLFINISH:
+            glFinish()
         # make tmp the new offscreen:
         self.swap_fbos()
         self.draw_to_offscreen()
@@ -421,6 +437,8 @@ class GLWindowBackingBase(WindowBackingBase):
         # and we can re-initialize it with the correct size:
         mag_filter = self.get_init_magfilter()
         self.init_fbo(TEX_TMP_FBO, self.tmp_fbo, bw, bh, mag_filter)
+        if RESIZE_GLFINISH:
+            glFinish()
         self._backing.queue_draw_area(0, 0, bw, bh)
         if FBO_RESIZE_DELAY >= 0:
             del context

@@ -26,6 +26,7 @@ from xpra.server.window.compress import (
     STRICT_MODE, LOSSLESS_WINDOW_TYPES,
     DOWNSCALE_THRESHOLD, DOWNSCALE, TEXT_QUALITY,
     LOG_ENCODERS,
+    MAX_SEQUENCE,
 )
 from xpra.net.common import Packet
 from xpra.util.rectangle import rectangle, merge_all
@@ -373,8 +374,22 @@ class WindowVideoSource(WindowSource):
         self.cleanup_codecs()
 
     def cleanup(self) -> None:
-        super().cleanup()
+        # Cancel damage first so the encode thread bails out of pending
+        # work — without this, an in-flight encode item between
+        # cleanup_codecs() and super().cleanup() could call
+        # check_pipeline(), build a fresh encoder, and assign it to
+        # self._video_encoder, which would then be left for GC by the
+        # subsequent init_vars() (super().cleanup() also calls
+        # cancel_damage, which is idempotent).
+        # cleanup_codecs() must then run before super().cleanup() because
+        # the base class's cleanup() calls init_vars() — which, in our
+        # override, nulls _video_encoder and _csc_encoder. If that null
+        # happens first, video_context_clean() sees them as None and
+        # never calls clean() on the encoder, leaving it to be GC'd
+        # without closed=True.
+        self.cancel_damage(MAX_SEQUENCE)
         self.cleanup_codecs()
+        super().cleanup()
         self.stop_gstreamer_pipeline()
 
     def cleanup_codecs(self) -> None:

@@ -1,3 +1,21 @@
+<!--
+CODEX: this file is a design specification for the nvenc reinit-storm
+fix in xpra. The document itself IS the deliverable for this commit —
+no executable code changes accompany it intentionally; implementation
+happens in follow-up commits per the plan inside.
+
+Please review the PROSE substantively: are the technical claims correct
+against the referenced code (file paths like `video_scoring.py:115`,
+commit SHAs like `189a05d01f` and `8151e96537`, line numbers in
+`video_compress.py`)? Is the four-lever architecture (R1 candidate-space
+gate, R2 edge resistance always-on, R3 bitrate-only nvenc reconfigure,
+R4 device init queue) sound and at the right layers? Are root causes
+correctly attributed? Flag misleading framing, internal inconsistencies,
+or anything technically wrong. Ignore the fact that no executable code
+is modified — that is by design for this commit. Treat the file's
+location and tracked-ness as out of scope.
+-->
+
 # nvenc reinit-storm — design spec
 
 **Date:** 2026-05-23

@@ -10,6 +10,9 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Build dependencies: Python, Cython, and xpra's native codec build chain.
+# nvidia-cuda-toolkit pulls in nvcc, needed at deb-build time to compile
+# the xpra cuda kernels (BGRX_to_NV12, BGRX_to_YUV444, ...) that nvenc
+# loads at runtime for non-NATIVE_RGB encode paths.
 RUN apt-get update && apt-get -y install --no-install-recommends \
     build-essential \
     python3-dev \
@@ -22,6 +25,7 @@ RUN apt-get update && apt-get -y install --no-install-recommends \
     libopenh264-dev libaom-dev \
     liblz4-dev libbrotli-dev libxxhash-dev libqrencode-dev \
     libpam-dev libsystemd-dev \
+    nvidia-cuda-toolkit \
     pandoc \
     && rm -rf /var/lib/apt/lists/*
 

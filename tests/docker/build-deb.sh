@@ -51,6 +51,19 @@ if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
     docker build -t "$IMAGE_NAME" -f "$SCRIPT_DIR/Dockerfile.deb" "$SCRIPT_DIR"
 fi
 
+# Cuda-kernels enablement requires nvcc in the deb image. An older cached
+# $IMAGE_NAME (or one whose base $NVENC_IMAGE was rebuilt without also
+# rebuilding the deb image) would silently be reused and fail later inside
+# debuild with the unhelpful "rebuilding XRGB_to_NV12: no file" message.
+# Probe the deb image (which is what actually runs the build) and rebuild
+# both it and its base if nvcc is missing.
+if ! docker run --rm "$IMAGE_NAME" which nvcc >/dev/null 2>&1; then
+    echo "Rebuilding images: $IMAGE_NAME (or its base) is missing nvcc..."
+    docker rmi "$IMAGE_NAME" "$NVENC_IMAGE" >/dev/null 2>&1 || true
+    docker build -t "$NVENC_IMAGE" -f "$SCRIPT_DIR/Dockerfile.nvenc" "$SCRIPT_DIR"
+    docker build -t "$IMAGE_NAME" -f "$SCRIPT_DIR/Dockerfile.deb" "$SCRIPT_DIR"
+fi
+
 GIT_SHA=$(git -C "$REPO_DIR" rev-parse --short HEAD)
 GIT_BRANCH=$(git -C "$REPO_DIR" branch --show-current)
 GIT_LOCAL_MODS=$(git -C "$REPO_DIR" diff --shortstat 2>/dev/null | wc -l)
@@ -99,6 +112,7 @@ docker run --rm \
             --exclude="*.deb" \
             --exclude="*.buildinfo" \
             --exclude="*.changes" \
+            --exclude="*.fatbin" \
             /xpra/ "$SRC/"
 
         cd "$SRC"
@@ -117,14 +131,16 @@ REVISION = 0
 EOF
 
         # Drop --with-qt6_client (Andrew does not use the Qt6 client).
-        # Disable nvfbc/nvdec/nvjpeg/cuda_kernels — only nvenc is wanted, and
+        # Disable nvfbc/nvdec/nvjpeg — only nvenc is wanted, and
         # nvfbc/nvjpeg need libnvidia-fbc1 which we do not stub.
+        # Keep cuda_kernels: nvenc loads BGRX_to_{NV12,YUV444}.fatbin at
+        # runtime for non-NATIVE_RGB encode paths.
         # idempotent: re-running on a clean cache produces the same file.
         cp debian/rules debian/rules.orig 2>/dev/null || true
         cp debian/rules.orig debian/rules 2>/dev/null || true
         sed -i \
             -e "s/ --with-qt6_client//" \
-            -e "s|^BUILDOPTS := \$(EXTRA_BUILDOPTS).*|BUILDOPTS := \$(EXTRA_BUILDOPTS) --without-qt6_client --without-pyglet_client --without-amf --without-nvdec --without-nvfbc --without-nvjpeg_encoder --without-nvjpeg_decoder --without-cuda_kernels --without-docs --without-pandoc_lua|" \
+            -e "s|^BUILDOPTS := \$(EXTRA_BUILDOPTS).*|BUILDOPTS := \$(EXTRA_BUILDOPTS) --without-qt6_client --without-pyglet_client --without-amf --without-nvdec --without-nvfbc --without-nvjpeg_encoder --without-nvjpeg_decoder --without-docs --without-pandoc_lua|" \
             debian/rules
 
         # --without-docs skips generating /usr/share/doc/xpra/ but
@@ -139,6 +155,12 @@ EOF
         printf "$NEW_ENTRY" > /tmp/changelog.new
         cat debian/changelog >> /tmp/changelog.new
         mv /tmp/changelog.new debian/changelog
+
+        # Clear stale .deb / .buildinfo / .changes from prior runs in the
+        # cache parent dir (where debuild writes its output). Otherwise
+        # every rebuild leaves the previous versions behind and the cp
+        # loop below copies all of them to /out, piling up across runs.
+        rm -f ../*.deb ../*.buildinfo ../*.changes 2>/dev/null || true
 
         # Build binary packages only (-b), no source archive.
         # -us -uc: skip signing source / changes (no GPG key in container).

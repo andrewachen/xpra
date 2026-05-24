@@ -173,7 +173,7 @@ Ships alone first on `feature/nvenc-reinit-instrument-v6.4.3`, port to `feature/
 
 ### What we add
 
-1. **Aggregate reinit counter** (per-window int). Single field on `WindowVideoSource`, incremented at the top of `video_context_clean()` (line 404). Exposed via `get_info()` as `reinit_count`. ~5 LOC.
+1. **Aggregate reinit counter** (per-window int). Single field on `WindowVideoSource`, incremented inside the existing `if csce or ve:` block in `video_context_clean()` (so no-op calls where both are already `None` don't inflate the count — that block is the real teardown work). Exposed via `get_info()` as `reinit_count`. ~5 LOC.
 
 2. **`cdc.lock` warning enrichment** in `cuda_device_context.__enter__` (`cuda/context.py:540`). When the non-blocking acquire fails, log the current holder + phase (init / cleanup / compress) alongside the existing "failed to acquire cuda device lock" message. Confirms the "init-vs-encode on shared device" diagnosis and lets us measure blast-radius window length. ~10 LOC.
 
@@ -236,12 +236,12 @@ def update_encoding_options(self, force_reload=False):
     new_space = self._compute_candidate_space()
     space_changed = (new_space != self._last_candidate_space)
     if force_reload:
-        self.video_context_clean("force_reload")
+        self.video_context_clean()
     if space_changed or force_reload:
         self.update_pipeline_scores(force_reload)
         self._last_candidate_space = new_space
         if not self.verify_csc_and_encoder() and not force_reload:
-            self.video_context_clean("verify_failed_after_space_change")
+            self.video_context_clean()
     else:
         # candidate space unchanged → push operating-point only
         self._push_operating_point()
@@ -270,7 +270,7 @@ def _maybe_invalidate_for_operating_point(self):
     if new_space != self._last_candidate_space:
         # candidate space genuinely changed (e.g., YUV444_THRESHOLD crossing
         # or scaling cascade) — full teardown is correct
-        self.video_context_clean("quality_changed")  # or "speed_changed"
+        self.video_context_clean()  # candidate space changed, full teardown
     else:
         # operating point moved but candidate space stable — push to live encoder
         self._push_operating_point()
@@ -287,7 +287,7 @@ def encode_frame_failed(self):
     self._consecutive_encode_failures += 1
     if self._consecutive_encode_failures >= R1_FORCE_RESELECT_AFTER:
         log.warn(f"forcing encoder re-selection after {n} consecutive failures")
-        self.video_context_clean("safety_valve")
+        self.video_context_clean()
         self._last_candidate_space = None  # force re-score
         self._consecutive_encode_failures = 0
 
@@ -411,11 +411,23 @@ def set_encoding_quality(self, int quality) -> None:
     self._apply_reconfigure(reset_encoder=1, force_idr=1)
 
 cdef _apply_reconfigure(self, int reset_encoder, int force_idr):
+    # Per Prerequisite 2 below: do NOT call self.init_params() here —
+    # it re-runs get_preset() and would change presetGUID, which nvenc
+    # reconfigure forbids. Use the cached init-params snapshot taken at
+    # init time and overlay only the rate-control fields.
     cdef NV_ENC_RECONFIGURE_PARAMS reconfigure_params
     memset(&reconfigure_params, 0, sizeof(NV_ENC_RECONFIGURE_PARAMS))
     reconfigure_params.version = NV_ENC_RECONFIGURE_PARAMS_VER
     try:
-        self.init_params(self.codec, &reconfigure_params.reInitEncodeParams)
+        # Copy the cached init-params snapshot (struct copy + deep copy
+        # of any heap-allocated fields like encodeConfig). The snapshot
+        # was captured into self._init_params_snapshot at successful init.
+        self._copy_cached_init_params(&reconfigure_params.reInitEncodeParams)
+        # Overlay updated rate-control fields from self.target_bitrate /
+        # self.max_bitrate. tune_qp() should be reused for this; once R3
+        # prerequisite 1 lands it populates rc.averageBitRate / maxBitRate.
+        if reconfigure_params.reInitEncodeParams.encodeConfig != NULL:
+            self.tune_qp(&reconfigure_params.reInitEncodeParams.encodeConfig.rcParams)
         reconfigure_params.resetEncoder = reset_encoder
         reconfigure_params.forceIDR = force_idr
         with nogil:
@@ -426,7 +438,7 @@ cdef _apply_reconfigure(self, int reset_encoder, int force_idr):
             free(reconfigure_params.reInitEncodeParams.encodeConfig)
 ```
 
-`set_encoding_speed` likewise calls `_apply_reconfigure` after `update_bitrate`.
+`set_encoding_speed` likewise calls `_apply_reconfigure` after `update_bitrate`, but only after first verifying that `get_preset()` for the new speed still returns the same `presetGUID` as cached (see Prerequisite 2).
 
 ### Lock interaction
 
@@ -470,8 +482,9 @@ Phase 0 ships to orbital first. After 24-72h of baseline collection, R1-R3 land 
 ## Verification
 
 ### Phase 0
-- Counter dict appears in `xpra info :100 | grep -A30 reinit_counters` for every active window.
-- Manual test: trigger `force_reload` via `xpra control :100 encoding h264` → confirm `force_reload` counter bumps.
+- Aggregate counter appears in `xpra info :100 | grep reinit_count` for every active window.
+- Manual test: trigger any teardown (`xpra control :100 encoding h264`) → confirm `reinit_count` increments. No-op cleanup paths (cancel, repeated cleanup) must NOT increment.
+- `cdc.lock` warning enrichment: trigger a tab-restore storm; confirm at least one enriched warning shows current-holder + phase fields.
 - 24h soak collects baseline.
 
 ### R1-R3 gates (from memo)

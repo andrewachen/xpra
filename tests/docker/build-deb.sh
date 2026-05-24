@@ -170,7 +170,13 @@ EOF
         #      `setup.py clean` which wipes object files and forces full
         #      gcc recompilation even when nothing changed.
         # -j$(nproc): parallel build across all cores.
-        debuild -nc -b -us -uc -d -j$(nproc)
+        # DEB_BUILD_OPTIONS=nostrip: skip dh_strip. Keeps full symbol tables
+        # in the installed Cython .so files so gdb on a core dump resolves
+        # nvenc/codec frames to real function names (__pyx_pf_..._compress_image
+        # etc.) instead of `??`. Cost: +20-50 MB across all codec .debs;
+        # zero runtime cost. Counterpart for build-nvenc.sh: distutils
+        # already produces unstripped .so by default.
+        DEB_BUILD_OPTIONS=nostrip debuild -nc -b -us -uc -d -j$(nproc)
 
         # Copy only the .deb files Andrew actually installs. Quiet on misses
         # so an empty xpra-client-qt6 stanza does not break the script.

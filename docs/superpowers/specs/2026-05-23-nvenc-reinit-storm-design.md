@@ -4,44 +4,46 @@ fix in xpra. The document itself IS the deliverable for this commit —
 no executable code changes accompany it intentionally; implementation
 happens in follow-up commits per the plan inside.
 
-This is the THIRD pass of this spec. Prior passes addressed multiple
-substantive issues you flagged: instrumentation choke point, scaling
-cascade, R3 framing, R4 redundancy. The SECOND pass introduced a new
-error — elevating `quality_changed`/`speed_changed` to "the dominant
-storm engine" — which your second review correctly flagged because
-those are GObject notify handlers that the auto-tuner does NOT fire.
-The auto-tuner runs through `WindowSource.reconfigure() →
-update_quality/update_speed → update_encoding_options`. This pass
-rolls back that elevation and treats R1's gate in `update_encoding_
-options` as the primary intercept (matching the project's stored memo
-on the topic). The `quality_changed`/`speed_changed` reroute is
-demoted to a secondary fix for client-driven changes.
+This is the FIFTH pass of this spec. Prior reviews each surfaced 4
+substantive issues that have been addressed in iteration. Pass 4 added
+issues around: (a) `_effective_encoder_pixel_format` keyed on the
+current encoder only (missed per-candidate transitions for
+`encoding=auto`); (b) tuple using `self.actual_scaling` (the installed
+pipeline's scaling, lags reality) instead of fresh-computed desired
+scaling; (c) R3's reconfigure path re-running `init_params()` which
+calls `get_preset()` — speed nudges crossing a preset boundary would
+fail because NVENC reconfigure forbids preset change.
 
-This pass also: (a) keys the R1 candidate-space tuple on the
-hysteretic `_effective_encoder_pixel_format` (the output of
-`get_target_pixel_format` with Y2 deadband) instead of a raw quality
-band — so Y2's hysteresis is inherited by R1 instead of being defeated
-by it; (b) stores the edge-resistance diagnostic snapshot out-of-band
-on `WindowVideoSource._last_score_diagnostic` instead of mutating the
-score tuple (which would break `setup_pipeline_option(*option)` and
-`get_pipeline_score_info(*lp)` positional consumers); (c) adds a R3
-prerequisite section about wiring up `tune_qp`'s commented-out
-`averageBitRate`/`maxBitRate` assignments — without this, R3's
-`_apply_reconfigure` would send the OLD bitrate to nvenc and be a
-no-op.
+Pass 5 corrections:
+
+1. **R1 tuple element**: `_candidate_pixel_format_fingerprint` is now a
+   hash of the per-candidate target-pixel-format MAP (with Y2 deadband
+   applied per candidate), not a single value from the current encoder.
+   This catches `encoding=auto` transitions where the current encoder's
+   pixel format wouldn't change but a different candidate would win.
+2. **R1 scaling**: tuple uses `_desired_scaling` (fresh from
+   `calculate_scaling()`), not `self.actual_scaling` (installed
+   pipeline). Avoids the lag.
+3. **R3 preset preservation**: added Prerequisite 2 explaining that
+   `_apply_reconfigure()` must NOT re-call `init_params()`. Instead,
+   cache the original `presetGUID` at init time and copy that snapshot
+   into `reInitEncodeParams`, overlaying only rate-control fields.
+   Speed nudges crossing a preset boundary fall through to teardown.
+4. **Phase 0 slimmed**: per-path counter machinery dropped. Phase 0 now
+   covers only (a) aggregate reinit counter + (b) cdc.lock warning
+   enrichment. Per-path / delta-type / edge-resistance diagnostics
+   deferred to lever-specific opt-in env vars. ~15 LOC instead of 50-80.
+   The function-signature change on `video_context_clean(reason)` is
+   dropped — much less invasive for upstream.
 
 Please review the PROSE substantively: are the technical claims correct
-against the referenced code (file paths, line numbers, commit SHAs)?
-Is the three-lever architecture (R1 gate on update_encoding_options +
-optional reroute for client-driven notifies, R2 edge resistance
-always-on, R3 bitrate-only nvenc reconfigure with rate-control wiring)
-sound? Are root causes correctly attributed? Specifically check: does
-R1's tuple via `_effective_encoder_pixel_format` actually capture the
-right transitions? Does the `tune_qp` rate-control plumbing direction
-match what `nvEncReconfigureEncoder` expects? Flag misleading framing,
-internal inconsistencies, or anything technically wrong. Ignore the
-fact that no executable code is modified — that is by design for this
-commit. Treat the file's location and tracked-ness as out of scope.
+against the referenced code? Is the three-lever architecture sound?
+Specifically check: does the per-candidate fingerprint approach actually
+catch the AV1-vs-h264 mixed-candidate transition? Does the cached-preset
+approach in `_apply_reconfigure` align with NVENC SDK 13 semantics for
+`nvEncReconfigureEncoder`? Flag misleading framing, internal
+inconsistencies, or anything technically wrong. Treat the file's
+location and tracked-ness as out of scope.
 -->
 
 # nvenc reinit-storm — design spec
@@ -163,52 +165,39 @@ An init queue would not change this — the blast radius of each ~100-200ms init
 
 The alternative — making compress_image block on cdc.lock instead of non-blocking — would just trade warning spam for latency spikes during init/cleanup. The upstream code already retries via the TransientCodecException path, so the warnings ARE the retry mechanism's surface signal.
 
-## Phase 0 — Instrumentation
+## Phase 0 — Instrumentation (quantify-only)
 
-Ships alone first on `feature/nvenc-reinit-instrument-v6.4.3`, port to `feature/nvenc-reinit-instrument-master`. Build via `./tests/docker/build-deb.sh --deploy`. Baseline measurement: 24h of normal use including at least one Edge tab-restore + one sustained video playback. Dump `xpra info :100 | jq '.. | .reinit_counters? // empty'` hourly into a CSV.
+Ships alone first on `feature/nvenc-reinit-instrument-v6.4.3`, port to `feature/nvenc-reinit-instrument-master`. Build via `./tests/docker/build-deb.sh --deploy`. Baseline measurement: 24h of normal use including at least one Edge tab-restore + one sustained video playback.
 
-### Counters
+**Scoped strictly to quantifying improvement.** Identifying which path dominates is deferred — code analysis (`update_encoding_options` from `WindowSource.reconfigure()`) is strong enough to act on, and per-path diagnosis can be added reactively if R1/R2/R3 don't fully clear the storm.
 
-1. **Reinit-by-path** (per-window dict): path name → count. Path names match `video_context_clean()` call sites — note that this is the actual choke point, NOT `cleanup_codecs()` which is just one of several wrappers:
-   - `"force_reload"` — `update_encoding_options(force_reload=True)`
-   - `"verify_failed"` — `update_encoding_options` via `verify_csc_and_encoder()` returning False
-   - `"verify_failed_after_space_change"` — same as above but with R1 in place (post-Phase 1)
-   - `"no_video"` — `update_pipeline_scores` `checknovideo()` paths
-   - `"new_encoding"` — `set_new_encoding`
-   - `"video_subregion"` — `update_encoding_video_subregion` triggered teardown
-   - `"quality_changed"` — direct call from `quality_changed()` (line 806) — expected to be a dominant pre-R1 signal
-   - `"speed_changed"` — direct call from `speed_changed()` (line 811) — expected to be a dominant pre-R1 signal
-   - `"encoder_timeout"` — `video_encoder_timeout()` (line 2724)
-   - `"encoder_closed"` — direct call when active encoder reports closed (line 2619)
-   - `"safety_valve"` — R1's consecutive-failure safety valve (post-Phase 1)
-   - `"shutdown"` — cleanup at shutdown (filtered from storm view)
-   - `"unspecified"` — anything missed (must stay at 0 in steady state)
+### What we add
 
-2. **Delta-type** (per-window dict): bumped after teardown + new init by comparing pre-teardown spec vs new spec:
-   - `"bitrate_only"` — pixel_format, dims, codec_type, csc, scaling identical (R3's potential reach)
-   - `"pixel_format_change"` — pixel_format differs
-   - `"dim_change"` — encoder dims differ
-   - `"codec_change"` — codec_type differs
-   - `"csc_change"` — csc dst format differs
-   - `"scaling_change"` — scaling tuple (output of `calculate_scaling`) differs
+1. **Aggregate reinit counter** (per-window int). Single field on `WindowVideoSource`, incremented at the top of `video_context_clean()` (line 404). Exposed via `get_info()` as `reinit_count`. ~5 LOC.
 
-3. **Edge resistance snapshot** (per-window): last winner's `detection`, `setup_cost_mult`, `ee_score`, `ecsc_score`. Validates R2's assumption that `detection=False` is common. **Stored out-of-band** on `WindowVideoSource` as `_last_score_diagnostic = {...}`, NOT appended to the score tuple — the tuple's positional layout is consumed by `setup_pipeline_option(*option)` (video_compress.py:1998) and `get_pipeline_score_info(*lp)` (line 355). Updated when `update_pipeline_scores()` completes; the winning score's diagnostic fields are captured then.
+2. **`cdc.lock` warning enrichment** in `cuda_device_context.__enter__` (`cuda/context.py:540`). When the non-blocking acquire fails, log the current holder + phase (init / cleanup / compress) alongside the existing "failed to acquire cuda device lock" message. Confirms the "init-vs-encode on shared device" diagnosis and lets us measure blast-radius window length. ~10 LOC.
 
-4. **cdc.lock blast-radius marker** (per-device, journal-level): on every `TransientCodecException` from `cuda_device_context.__enter__`, log which encoder currently holds the lock and what phase (init / cleanup / compress). Confirms the "init-vs-encode on shared device" diagnosis and quantifies blast radius. Logged inline with the existing warning, not aggregated.
+### What we DON'T add in Phase 0
 
-### Implementation
+- **Per-path `reason` parameter on `video_context_clean()`** — invasive (touches ~13 call sites with a function-signature change), and we don't need per-path identification given the code analysis. If R1/R2/R3 land and the storm doesn't improve as expected, per-path counters can be added as a follow-up.
+- **Delta-type tracking (bitrate_only vs pixel_format_change etc.)** — moderate scope, R3-design-validation specific. Defer until Phase 3 if we want to measure R3's actual reach.
+- **Edge-resistance snapshot (detection/setup_cost_mult/ee_score/ecsc_score)** — R2-design-validation specific. Defer to R2 implementation; add behind `XPRA_R2_DIAG=1` env var when needed.
+- **R1 gate diagnostic counters** (skipped vs re-scored, reasons) — R1-design-validation specific. Bake into Phase 1 behind `XPRA_R1_DIAG=1` env var.
 
-`video_context_clean()` (line 404 in `video_compress.py`) is the actual choke point — `cleanup_codecs()`, `quality_changed()`, `speed_changed()`, `video_encoder_timeout()`, and the encoder-closed handling all funnel through it. Add a `reason: str = "unspecified"` parameter; each caller passes its identifier. For delta-type, `prev_spec_snapshot` captures `(pixel_format, width, height, codec_type, csc_dst_format, scaling)` before teardown; after new encoder is built, diff against new spec.
+### Existing diagnostics (no new code)
 
-`get_pipeline_score()` returns the existing 11-field tuple unchanged; `update_pipeline_scores()` separately computes the diagnostic snapshot for the winning candidate (re-deriving `detection`/`setup_cost_mult`/`ee_score`/`ecsc_score` using the same logic) and stores it in `WindowVideoSource._last_score_diagnostic`. Exposed via `get_info()`.
+- `journalctl --user -u xpra.service | grep 'failed to acquire cuda device lock' | wc -l` → rate per minute.
+- `journalctl --user -u xpra.service | grep 'failed to encode h265 frame' | wc -l` → rate per minute.
+- `xpra info :100 | grep context_count` → 1 = healthy, 2 = mid-cycle.
+- `xpra info :100 | grep reinit_count` (after Phase 0) → aggregate per window.
 
-`WindowVideoSource.get_info()` adds `reinit_counters` sub-dict. Surfaces in `xpra info :100`.
+### Baseline collection
 
-Counters bump only on teardown — zero hot-path cost.
+24h of normal use. CSV columns: timestamp, `reinit_count` deltas per active window per 5min, `cdc.lock` warning rate, `failed to encode` rate. The 5min bucket smooths over individual storms; the daily total quantifies steady-state.
 
 ### Cost
 
-~50-80 LOC across `video_compress.py` + `video_scoring.py` + a small `reinit_stats.py` helper.
+~15 LOC across `video_compress.py` + `cuda/context.py`. No new helper module. No function-signature changes.
 
 ## Phase 1 — R1 candidate-space-only re-scoring
 
@@ -218,24 +207,25 @@ Cached on `WindowVideoSource`. The tuple includes both **raw inputs** that the s
 
 ```python
 _candidate_space = (
-    self.encoding,                       # "auto", "h264", "hevc", "stream", ...
-    self.content_type,                   # "text", "video", "browser", ...
-    self.common_video_encodings,         # tuple of negotiated encodings
-    self.pixel_format,                   # input pixel format from window
-    self.window_dimensions,              # (w, h) after width_mask/height_mask
-    self.video_subregion.rectangle,      # None or rect
-    self.full_csc_modes,                 # client's csc capabilities
-    self._effective_encoder_pixel_format,# OUTPUT of get_target_pixel_format with Y2 hysteresis
-    self.actual_scaling,                 # current (num, den) result from calculate_scaling
+    self.encoding,                                # "auto", "h264", "hevc", "stream", ...
+    self.content_type,                            # "text", "video", "browser", ...
+    self.common_video_encodings,                  # tuple of negotiated encodings
+    self.pixel_format,                            # input pixel format from window
+    self.window_dimensions,                       # (w, h) after width_mask/height_mask
+    self.video_subregion.rectangle,               # None or rect
+    self.full_csc_modes,                          # client's csc capabilities
+    self._candidate_pixel_format_fingerprint,     # hash of per-candidate target-pixel-format map (Y2-hysteretic)
+    self._desired_scaling,                        # fresh (num, den) from calculate_scaling for current state
 )
 ```
 
 Two derived elements need explanation:
 
-- **`_effective_encoder_pixel_format`**: the result of calling the encoder's `get_target_pixel_format()` (or the equivalent logic for non-nvenc paths) with the current quality. Critically, Y2's deadband is applied INSIDE `get_target_pixel_format`, so this value stays stable across small oscillations (e.g., 83↔87) and only flips when quality drops below `YUV444_THRESHOLD - YUV444_DEADBAND` or rises above `YUV444_THRESHOLD`. R1's tuple thus inherits Y2's hysteresis automatically. **Anti-pattern**: keying the tuple on a raw `quality_band` flipping at 85 would force R1 to teardown at 84↔85 BEFORE Y2's deadband can suppress it.
-- **`actual_scaling`**: `calculate_scaling()` consumes many inputs (`scaling_control`, `client_render_size`, `actual_scaling`, fullscreen heuristics in `update_actual_scaling`). Several of those cascade from quality/speed in auto-tuner mode. Capturing the **result** rather than the inputs is structurally correct: if scaling stays the same, the encoder dimensions stay the same and re-scoring is unnecessary; if scaling changes, encoder dimensions change and re-scoring is required. The cached value is refreshed inside `_compute_candidate_space()` before comparison.
-
-For non-nvenc encoders that don't have pixel-format-vs-quality logic, `_effective_encoder_pixel_format` falls back to `self.pixel_format` (i.e., a no-op element).
+- **`_candidate_pixel_format_fingerprint`**: a fingerprint of the per-candidate target pixel format map, NOT a single value computed from the current encoder. For each candidate in `common_video_encodings`, compute what its `get_target_pixel_format()`-equivalent would return given current quality (with Y2 deadband applied). Sort and hash the resulting map. This avoids two failure modes the single-value approach has:
+  - For `encoding=auto` with mixed candidates (e.g., AV1 stays NV12 while h264/h265 can switch to YUV444P at high quality), the current encoder's pixel format won't change when crossing quality 85, so a single-value approach would suppress the re-score that should pick the higher-quality candidate.
+  - The fingerprint inherits Y2's deadband automatically: small oscillations 83↔87 don't change the map, so R1's gate stays closed and no teardown fires.
+  - For non-nvenc candidates without pixel-format-vs-quality logic, their entry in the map is constant — they don't perturb the fingerprint.
+- **`_desired_scaling`**: fresh output of `calculate_scaling()` given current width/height + auto-tuner state. NOT `self.actual_scaling` (which describes the **installed** pipeline and lags reality). The tuple compares the **desired** scaling against the candidate-space cache. When quality/speed nudges shift `calculate_scaling`'s output, the desired value changes immediately even before any new pipeline exists. `_compute_candidate_space()` computes this fresh each invocation; `self.actual_scaling` is mutated only when a new pipeline is installed.
 
 ### Gate (in `update_encoding_options`)
 
@@ -370,9 +360,9 @@ Reduces oscillation around quality=85 by 5 quality points. The auto-tuner typica
 
 R3 is genuinely new code — the 2017 code at commit `189a05d01f` only invoked `nvEncReconfigureEncoder` for pixel-format/lossless changes (which reconfigure can't handle, hence the disable). It explicitly returned on bitrate-only changes. There has never been a working bitrate-only reconfigure path in xpra's nvenc encoder.
 
-Pattern: when `set_encoding_quality()`/`set_encoding_speed()` is called and target pixel_format/lossless are unchanged, call `nvEncReconfigureEncoder` with the new bitrate. When pixel_format/lossless WOULD change, fall through to teardown (R1's `_effective_encoder_pixel_format` tuple element catches that case).
+Pattern: when `set_encoding_quality()`/`set_encoding_speed()` is called and target pixel_format/lossless are unchanged, call `nvEncReconfigureEncoder` with the new bitrate. When pixel_format/lossless WOULD change, fall through to teardown (R1's `_candidate_pixel_format_fingerprint` tuple element catches that case).
 
-### Prerequisite: wire up rate control
+### Prerequisite 1: wire up rate control
 
 `update_bitrate()` (encoder.pyx:1334) computes `self.target_bitrate` and `self.max_bitrate` but those are **never pushed to nvenc**. In `tune_qp()` (line 870-908), the rate-control assignments are commented out (lines 901-904):
 
@@ -388,8 +378,20 @@ Same pattern at lines 1621-1635 (per-frame). So today, `self.target_bitrate` is 
 R3 cannot work without first plumbing these through. The implementation must:
 
 1. Add proper rate-control field population in `tune_qp()`. Replace the commented-out lines with logic that selects the right NV_ENC_PARAMS_RC_MODE (`NV_ENC_PARAMS_RC_VBR` is the safe default for bitrate-target operation) and sets `rc.averageBitRate = self.target_bitrate` and `rc.maxBitRate = self.max_bitrate`.
-2. Verify `tune_qp` is called both during `init_params()` (for fresh inits) and during `_apply_reconfigure()` (so the new bitrate values land in `reconfigure_params.reInitEncodeParams.encodeConfig->rcParams`).
+2. Verify `tune_qp` is called during the reconfigure path (so the new bitrate values land in `reconfigure_params.reInitEncodeParams.encodeConfig->rcParams`).
 3. The `tune_qp` change should be additive — preserve any QP-based path that's currently active (currently the function name suggests QP-mode logic exists somewhere, even if rate control assignments are commented out). Read the full `tune_qp` body before deciding which mode to switch to.
+
+### Prerequisite 2: preserve preset across reconfigure
+
+`init_params()` calls `get_preset()` which depends on speed/quality. If we re-invoke `init_params()` with the new speed during reconfigure, `get_preset()` may return a DIFFERENT `presetGUID` than the one the encoder was initialized with. **NVENC does not allow changing presetGUID on an existing encoder via `nvEncReconfigureEncoder`** — the call would fail.
+
+The reconfigure path must construct `reInitEncodeParams` WITHOUT re-running preset selection:
+
+1. Cache the original `presetGUID` (and possibly the whole `NV_ENC_INITIALIZE_PARAMS` snapshot) on the Encoder instance at init time.
+2. In `_apply_reconfigure()`, construct `reInitEncodeParams` by copying the cached snapshot, then overlay ONLY the rate-control fields (`rc.averageBitRate`, `rc.maxBitRate`, possibly rate-control mode). Do not call `init_params()` from within reconfigure.
+3. In `set_encoding_speed()`, compute what `get_preset()` would return for the new speed and compare to the cached preset. If different → preset boundary crossing → fall through to teardown instead of reconfigure (R1's candidate-space tuple won't catch this directly; we add `self._effective_preset_guid` to it OR detect at the encoder level and signal up via a teardown-eligible path).
+
+This makes R3's "bitrate-only" framing precise: bitrate-only AND same-preset AND same-pixel-format AND same-dims. Anything else falls through to teardown.
 
 ```python
 def set_encoding_quality(self, int quality) -> None:
@@ -403,7 +405,7 @@ def set_encoding_quality(self, int quality) -> None:
     new_lossless = self.get_target_lossless(new_pixel_format, target_quality)
     if new_pixel_format != self.pixel_format or new_lossless != self.lossless:
         # pixel format change → cannot reconfigure, fall through to teardown
-        # (R1's _effective_encoder_pixel_format tuple element will catch it on next tick)
+        # (R1's _candidate_pixel_format_fingerprint tuple element will catch it on next tick)
         return
     self.update_bitrate()
     self._apply_reconfigure(reset_encoder=1, force_idr=1)

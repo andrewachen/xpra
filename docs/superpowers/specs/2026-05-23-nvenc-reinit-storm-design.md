@@ -4,27 +4,44 @@ fix in xpra. The document itself IS the deliverable for this commit —
 no executable code changes accompany it intentionally; implementation
 happens in follow-up commits per the plan inside.
 
-This is the SECOND pass of this spec. The first pass had four levers
-(R1, R2, R3, R4); your prior review correctly flagged that (a) Phase 0
-instrumented the wrong choke point, (b) R1's candidate-space tuple
-missed scaling cascade, (c) R3 framing as "revival of 2017 code" was
-wrong (the 2017 code never had a bitrate-only path), and (d) R4 as
-"per-device init queue" was redundant because device_lock already
-serializes init-vs-init. This pass corrects all four; R4 is dropped
-entirely.
+This is the THIRD pass of this spec. Prior passes addressed multiple
+substantive issues you flagged: instrumentation choke point, scaling
+cascade, R3 framing, R4 redundancy. The SECOND pass introduced a new
+error — elevating `quality_changed`/`speed_changed` to "the dominant
+storm engine" — which your second review correctly flagged because
+those are GObject notify handlers that the auto-tuner does NOT fire.
+The auto-tuner runs through `WindowSource.reconfigure() →
+update_quality/update_speed → update_encoding_options`. This pass
+rolls back that elevation and treats R1's gate in `update_encoding_
+options` as the primary intercept (matching the project's stored memo
+on the topic). The `quality_changed`/`speed_changed` reroute is
+demoted to a secondary fix for client-driven changes.
+
+This pass also: (a) keys the R1 candidate-space tuple on the
+hysteretic `_effective_encoder_pixel_format` (the output of
+`get_target_pixel_format` with Y2 deadband) instead of a raw quality
+band — so Y2's hysteresis is inherited by R1 instead of being defeated
+by it; (b) stores the edge-resistance diagnostic snapshot out-of-band
+on `WindowVideoSource._last_score_diagnostic` instead of mutating the
+score tuple (which would break `setup_pipeline_option(*option)` and
+`get_pipeline_score_info(*lp)` positional consumers); (c) adds a R3
+prerequisite section about wiring up `tune_qp`'s commented-out
+`averageBitRate`/`maxBitRate` assignments — without this, R3's
+`_apply_reconfigure` would send the OLD bitrate to nvenc and be a
+no-op.
 
 Please review the PROSE substantively: are the technical claims correct
 against the referenced code (file paths, line numbers, commit SHAs)?
-Is the three-lever architecture (R1 candidate-space gate + quality/
-speed reroute, R2 edge resistance always-on, R3 bitrate-only nvenc
-reconfigure) sound? Are root causes correctly attributed? Specifically
-check: is the cdc.lock contention story in "Why no init queue" right?
-Is `quality_changed`/`speed_changed` actually going through
-`video_context_clean()` directly without passing through
-`update_encoding_options`? Flag misleading framing, internal
-inconsistencies, or anything technically wrong. Ignore the fact that
-no executable code is modified — that is by design for this commit.
-Treat the file's location and tracked-ness as out of scope.
+Is the three-lever architecture (R1 gate on update_encoding_options +
+optional reroute for client-driven notifies, R2 edge resistance
+always-on, R3 bitrate-only nvenc reconfigure with rate-control wiring)
+sound? Are root causes correctly attributed? Specifically check: does
+R1's tuple via `_effective_encoder_pixel_format` actually capture the
+right transitions? Does the `tune_qp` rate-control plumbing direction
+match what `nvEncReconfigureEncoder` expects? Flag misleading framing,
+internal inconsistencies, or anything technically wrong. Ignore the
+fact that no executable code is modified — that is by design for this
+commit. Treat the file's location and tracked-ness as out of scope.
 -->
 
 # nvenc reinit-storm — design spec
@@ -52,14 +69,13 @@ Three independent levers at three different code layers. (An earlier draft propo
 
 ### R1 — Selection coupled to operating-point nudges
 
-Two distinct paths to teardown that R1 must intercept:
+The auto-tuner runs on a timer (~every few seconds) calling `WindowSource.reconfigure()`, which invokes `update_quality()`/`update_speed()` (updating `_current_quality`/`_current_speed` directly — not through GObject notify signals) and then `update_encoding_options()`. The latter calls `update_pipeline_scores()` which re-runs scoring against the new quality/speed targets and can pick a different winner.
 
-1. **`update_encoding_options()`** runs on a timer (~every few seconds) AND on content-type changes. Each invocation calls `update_pipeline_scores()` which can pick a different winner.
-2. **`quality_changed()`** (line 806) and **`speed_changed()`** (line 811) call `video_context_clean()` *directly*, bypassing `update_encoding_options` entirely. Every operating-point nudge from the auto-tuner currently tears down the encoder before any scoring or stickiness logic gets a chance.
+For browser workloads where content_type and dimensions are stable for minutes but the auto-tuner generates sustained quality/speed nudges, this means **scoring re-runs on every tuner tick**. With close-scoring candidates (h264 vs hevc, NV12 vs YUV444P at quality threshold boundaries), small operating-point shifts flip the winner. Each flip triggers `verify_csc_and_encoder() == False` and `video_context_clean()`. **This is the storm's dominant engine for browser/text-y workloads.**
 
-For browser workloads where content_type and dimensions are stable for minutes but the auto-tuner generates sustained quality/speed nudges, this means **the encoder is torn down on every nudge**. With close-scoring candidates (h264 vs hevc, NV12 vs YUV444P at quality threshold boundaries), even when scoring would have picked the same winner, the teardown still happens. **This is the storm's dominant engine for browser/text-y workloads.**
+R1 gates `update_encoding_options` on candidate-space tuple comparison: skip re-scoring when nothing in the tuple changed; push the new operating point through `_push_operating_point()` instead. This is the primary intercept and matches the other Claude's memory framing of "decouple selection from operating-point nudges."
 
-R1 must therefore (a) reroute `quality_changed`/`speed_changed` to skip teardown when the candidate space is unchanged, and (b) gate `update_encoding_options` on candidate-space tuple comparison.
+`quality_changed()` and `speed_changed()` are GObject window-property notify handlers in `compress.py:772,777`. Their `compress.py` super methods only update `_quality_hint`/`_speed_hint` — they're triggered when a client explicitly sets quality/speed on a window (e.g., via `xpra control`). The `video_compress.py` override at line 804-811 currently calls `video_context_clean()` from these, which is heavyweight for what's usually a rare client-driven event. R1 reroutes those overrides through the same `_maybe_invalidate_for_operating_point()` helper to skip teardown when the candidate space is unchanged. This is a SECONDARY fix, NOT the dominant storm engine.
 
 For video playback in steady state, the candidate space and operating point are both stable; R1 doesn't change behavior.
 
@@ -176,7 +192,7 @@ Ships alone first on `feature/nvenc-reinit-instrument-v6.4.3`, port to `feature/
    - `"csc_change"` — csc dst format differs
    - `"scaling_change"` — scaling tuple (output of `calculate_scaling`) differs
 
-3. **Edge resistance snapshot** (per-window): last winner's `detection`, `setup_cost_mult`, `ee_score`, `ecsc_score`. Validates R2's assumption that `detection=False` is common.
+3. **Edge resistance snapshot** (per-window): last winner's `detection`, `setup_cost_mult`, `ee_score`, `ecsc_score`. Validates R2's assumption that `detection=False` is common. **Stored out-of-band** on `WindowVideoSource` as `_last_score_diagnostic = {...}`, NOT appended to the score tuple — the tuple's positional layout is consumed by `setup_pipeline_option(*option)` (video_compress.py:1998) and `get_pipeline_score_info(*lp)` (line 355). Updated when `update_pipeline_scores()` completes; the winning score's diagnostic fields are captured then.
 
 4. **cdc.lock blast-radius marker** (per-device, journal-level): on every `TransientCodecException` from `cuda_device_context.__enter__`, log which encoder currently holds the lock and what phase (init / cleanup / compress). Confirms the "init-vs-encode on shared device" diagnosis and quantifies blast radius. Logged inline with the existing warning, not aggregated.
 
@@ -184,7 +200,7 @@ Ships alone first on `feature/nvenc-reinit-instrument-v6.4.3`, port to `feature/
 
 `video_context_clean()` (line 404 in `video_compress.py`) is the actual choke point — `cleanup_codecs()`, `quality_changed()`, `speed_changed()`, `video_encoder_timeout()`, and the encoder-closed handling all funnel through it. Add a `reason: str = "unspecified"` parameter; each caller passes its identifier. For delta-type, `prev_spec_snapshot` captures `(pixel_format, width, height, codec_type, csc_dst_format, scaling)` before teardown; after new encoder is built, diff against new spec.
 
-`get_pipeline_score()` extends its return tuple with `(detection, setup_cost_mult, ee_score, ecsc_score)` as a debug field; `WindowVideoSource` stores the last-winner's snapshot in a field, exposed via `get_info()`.
+`get_pipeline_score()` returns the existing 11-field tuple unchanged; `update_pipeline_scores()` separately computes the diagnostic snapshot for the winning candidate (re-deriving `detection`/`setup_cost_mult`/`ee_score`/`ecsc_score` using the same logic) and stores it in `WindowVideoSource._last_score_diagnostic`. Exposed via `get_info()`.
 
 `WindowVideoSource.get_info()` adds `reinit_counters` sub-dict. Surfaces in `xpra info :100`.
 
@@ -198,26 +214,28 @@ Counters bump only on teardown — zero hot-path cost.
 
 ### Candidate-space tuple
 
-Cached on `WindowVideoSource`. The tuple includes both **raw inputs** that the scoring engine consumes AND **derived outputs** whose values cascade from operating-point changes:
+Cached on `WindowVideoSource`. The tuple includes both **raw inputs** that the scoring engine consumes AND **derived outputs** whose values cascade from operating-point changes. Critically, derived outputs are computed using the encoder's **hysteretic** logic (Y2 deadband etc.), not raw thresholds — otherwise R1's gate fires on transient oscillations that Y2 would have absorbed:
 
 ```python
 _candidate_space = (
-    self.encoding,                    # "auto", "h264", "hevc", "stream", ...
-    self.content_type,                # "text", "video", "browser", ...
-    self.common_video_encodings,      # tuple of negotiated encodings
-    self.pixel_format,                # input pixel format from window
-    self.window_dimensions,           # (w, h) after width_mask/height_mask
-    self.video_subregion.rectangle,   # None or rect
-    self.full_csc_modes,              # client's csc capabilities
-    self._target_quality_band,        # 0 if quality < YUV444_THRESHOLD else 1
-    self.actual_scaling,              # current (num, den) result from calculate_scaling
+    self.encoding,                       # "auto", "h264", "hevc", "stream", ...
+    self.content_type,                   # "text", "video", "browser", ...
+    self.common_video_encodings,         # tuple of negotiated encodings
+    self.pixel_format,                   # input pixel format from window
+    self.window_dimensions,              # (w, h) after width_mask/height_mask
+    self.video_subregion.rectangle,      # None or rect
+    self.full_csc_modes,                 # client's csc capabilities
+    self._effective_encoder_pixel_format,# OUTPUT of get_target_pixel_format with Y2 hysteresis
+    self.actual_scaling,                 # current (num, den) result from calculate_scaling
 )
 ```
 
 Two derived elements need explanation:
 
-- **`_target_quality_band`**: handles YUV444_THRESHOLD. Any quality crossing the threshold flips the band → tuple inequality → re-score is required because pixel format changes. (The threshold-deadband hysteresis (Y2) below reduces oscillation crossings.)
+- **`_effective_encoder_pixel_format`**: the result of calling the encoder's `get_target_pixel_format()` (or the equivalent logic for non-nvenc paths) with the current quality. Critically, Y2's deadband is applied INSIDE `get_target_pixel_format`, so this value stays stable across small oscillations (e.g., 83↔87) and only flips when quality drops below `YUV444_THRESHOLD - YUV444_DEADBAND` or rises above `YUV444_THRESHOLD`. R1's tuple thus inherits Y2's hysteresis automatically. **Anti-pattern**: keying the tuple on a raw `quality_band` flipping at 85 would force R1 to teardown at 84↔85 BEFORE Y2's deadband can suppress it.
 - **`actual_scaling`**: `calculate_scaling()` consumes many inputs (`scaling_control`, `client_render_size`, `actual_scaling`, fullscreen heuristics in `update_actual_scaling`). Several of those cascade from quality/speed in auto-tuner mode. Capturing the **result** rather than the inputs is structurally correct: if scaling stays the same, the encoder dimensions stay the same and re-scoring is unnecessary; if scaling changes, encoder dimensions change and re-scoring is required. The cached value is refreshed inside `_compute_candidate_space()` before comparison.
+
+For non-nvenc encoders that don't have pixel-format-vs-quality logic, `_effective_encoder_pixel_format` falls back to `self.pixel_format` (i.e., a no-op element).
 
 ### Gate (in `update_encoding_options`)
 
@@ -242,9 +260,9 @@ def update_encoding_options(self, force_reload=False):
 
 `_push_operating_point()` calls `self._video_encoder.set_encoding_quality(self._current_quality)` and `set_encoding_speed(self._current_speed)` directly. Today these are no-ops at nvenc level; R3 (below) makes them effective.
 
-### Quality/speed change reroute (the dominant storm fix)
+### Quality/speed change reroute (secondary fix for client-driven changes)
 
-`quality_changed()` and `speed_changed()` currently call `video_context_clean()` directly (line 806, 811). With R1 in place they must instead check the candidate-space tuple and only tear down if it changed:
+`quality_changed()` and `speed_changed()` overrides in `video_compress.py:804-811` currently call `video_context_clean()` directly. These fire only for client-driven property changes (NOT auto-tuner — auto-tuner uses `update_quality`/`update_speed` instead, which flow through `update_encoding_options` and are caught by the primary R1 gate above). With R1 in place these overrides instead check the candidate-space tuple and only tear down if it changed:
 
 ```python
 def quality_changed(self, window, *args) -> bool:
@@ -268,7 +286,7 @@ def _maybe_invalidate_for_operating_point(self):
         self._push_operating_point()
 ```
 
-This is the single biggest behavioral change R1 makes. Without it, the candidate-space gate in `update_encoding_options` is ineffective because every auto-tuner nudge tears down the encoder before that gate runs.
+Less critical than the primary gate (because the auto-tuner doesn't fire these signals), but still a measurable improvement for client-driven quality changes.
 
 ### Safety valve
 
@@ -352,7 +370,26 @@ Reduces oscillation around quality=85 by 5 quality points. The auto-tuner typica
 
 R3 is genuinely new code — the 2017 code at commit `189a05d01f` only invoked `nvEncReconfigureEncoder` for pixel-format/lossless changes (which reconfigure can't handle, hence the disable). It explicitly returned on bitrate-only changes. There has never been a working bitrate-only reconfigure path in xpra's nvenc encoder.
 
-Pattern: when `set_encoding_quality()`/`set_encoding_speed()` is called and target pixel_format/lossless are unchanged, call `nvEncReconfigureEncoder` with the new bitrate. When pixel_format/lossless WOULD change, fall through to teardown (R1's `_target_quality_band` tuple element catches that case).
+Pattern: when `set_encoding_quality()`/`set_encoding_speed()` is called and target pixel_format/lossless are unchanged, call `nvEncReconfigureEncoder` with the new bitrate. When pixel_format/lossless WOULD change, fall through to teardown (R1's `_effective_encoder_pixel_format` tuple element catches that case).
+
+### Prerequisite: wire up rate control
+
+`update_bitrate()` (encoder.pyx:1334) computes `self.target_bitrate` and `self.max_bitrate` but those are **never pushed to nvenc**. In `tune_qp()` (line 870-908), the rate-control assignments are commented out (lines 901-904):
+
+```python
+#rc.averageBitRate = 1
+...
+#rc.averageBitRate = self.max_bitrate or 10*1024*1024
+#rc.maxBitRate = self.max_bitrate or 10*1024*1024
+```
+
+Same pattern at lines 1621-1635 (per-frame). So today, `self.target_bitrate` is a vestigial field: it gets computed but nothing reads it.
+
+R3 cannot work without first plumbing these through. The implementation must:
+
+1. Add proper rate-control field population in `tune_qp()`. Replace the commented-out lines with logic that selects the right NV_ENC_PARAMS_RC_MODE (`NV_ENC_PARAMS_RC_VBR` is the safe default for bitrate-target operation) and sets `rc.averageBitRate = self.target_bitrate` and `rc.maxBitRate = self.max_bitrate`.
+2. Verify `tune_qp` is called both during `init_params()` (for fresh inits) and during `_apply_reconfigure()` (so the new bitrate values land in `reconfigure_params.reInitEncodeParams.encodeConfig->rcParams`).
+3. The `tune_qp` change should be additive — preserve any QP-based path that's currently active (currently the function name suggests QP-mode logic exists somewhere, even if rate control assignments are commented out). Read the full `tune_qp` body before deciding which mode to switch to.
 
 ```python
 def set_encoding_quality(self, int quality) -> None:
@@ -366,7 +403,7 @@ def set_encoding_quality(self, int quality) -> None:
     new_lossless = self.get_target_lossless(new_pixel_format, target_quality)
     if new_pixel_format != self.pixel_format or new_lossless != self.lossless:
         # pixel format change → cannot reconfigure, fall through to teardown
-        # (R1's _target_quality_band tuple element will catch it on next tick)
+        # (R1's _effective_encoder_pixel_format tuple element will catch it on next tick)
         return
     self.update_bitrate()
     self._apply_reconfigure(reset_encoder=1, force_idr=1)
@@ -405,7 +442,7 @@ The 2017 test commit `8151e96537` is not reusable — it tested the pixel-format
 
 ### Cost
 
-~80-100 LOC in `encoder.pyx` + 1 new test.
+~120-180 LOC in `encoder.pyx` (reconfigure path + rate-control plumbing in `tune_qp`) + 1-2 new tests (one for bitrate-only reconfigure, one for tune_qp rate-control population).
 
 ## ~~Phase 4~~ — Dropped
 

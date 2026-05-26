@@ -520,6 +520,20 @@ Phase 0 ships to orbital first. After 24-72h of baseline collection, R1-R3 land 
 3. **R3 cost-benefit if R1 alone is sufficient.** If Phase 0 data shows R1 reroute reduces reinit rate by >95%, R3 becomes a smaller win (most operating-point nudges no longer reach the encoder anyway). Still worth shipping for the runtime-bitrate capability and to make R1's `_push_operating_point()` path actually do something at the encoder level, but the framing shifts from "storm fix" to "capability unlock + bitrate accuracy."
 4. **Subregion-aware edge resistance.** Original `detection` gate on `setup_cost_mult` was added for a reason that's no longer documented. Possible original intent: when subregion detection is active, more aggressive bias because re-scoring is part of the detection flow. R2a removes the gate entirely; we may need to re-add a softer version (e.g., `setup_cost_mult = 1 + int(detection) * X` where X is calibrated) if instrumentation shows R2a sticks too aggressively in subregion-detection scenarios.
 
+## Future work (deferred)
+
+### Dynamic codec switching for non-subregion activity
+
+R1+R2+R3 handle two of three browser-interactivity scenarios:
+
+- **Light browsing** (low fps, no subregion): R2's setup-cost penalty biases initial pick toward simple codecs (webp/jpeg/nvjpeg); R1 keeps that pick stable through quality nudges. ✓
+- **Video starts playing** (subregion detection finds the rectangle): `video_subregion.rectangle` is already in R1's candidate-space tuple, so the None → Rect transition triggers re-score; with `detection=True`, fps bonus is active and nvenc wins. ✓
+- **Full-window animation / "crazy" pages** (high fps, but motion is global so subregion detection doesn't latch): no tuple element changes → R1 stays locked on the initial (simple) codec → pays bandwidth cost for what could have been encoded by nvenc. ✗
+
+The third case is deferred. If Phase 0 + post-deployment data shows it's a problem in practice (e.g., bandwidth usage stays elevated on heavy-animation sites because nvenc never engages), add an `_fps_band` tuple element with hysteresis (3 bands: quiet / active / heavy; asymmetric thresholds to avoid flapping). Pair with R2 de-gating: drop the `int(detection)` factor from the fps bonus in `setup_cost_mult` so the existing fps-vs-setup-cost mechanism works for non-subregion windows too. Estimated cost ~30 LOC + tuning. The two changes go together — R2 de-gating without `_fps_band` is a no-op because R1 prevents the scoring that would consume the new math.
+
+Why deferred: subregion detection probably covers most "real" video scenarios; the value of catching the remaining edge case is unknown without measurement; introducing yet another hysteresis on a noisy signal (fps) adds tuning surface we shouldn't pick blind.
+
 ## Sponsored-By
 
 Sponsored-By: Netflix

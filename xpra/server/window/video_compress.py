@@ -215,6 +215,7 @@ class WindowVideoSource(WindowSource):
         self.last_pipeline_params : tuple = ()
         self.last_pipeline_scores : tuple = ()
         self.last_pipeline_time: float = 0.0
+        self.reinit_count: int = 0
 
         self.video_subregion = VideoSubregion(self.refresh_subregion, self.auto_refresh_delay, VIDEO_SUBREGION)
         self.video_subregion.supported = VIDEO_SUBREGION
@@ -339,6 +340,7 @@ class WindowVideoSource(WindowSource):
         })
         einfo: dict[str, Any] = {
             "pipeline_param" : self.get_pipeline_info(),
+            "reinit_count"   : self.reinit_count,
             "scrolling"      : {
                 "enabled"      : self.supports_scrolling,
                 "min-percent"  : self.scroll_min_percent,
@@ -407,6 +409,7 @@ class WindowVideoSource(WindowSource):
         csce = self._csc_encoder
         ve = self._video_encoder
         if csce or ve:
+            self.reinit_count += 1
             if DEBUG_VIDEO_CLEAN:
                 log.warn("video_context_clean() for wid %i: %s and %s", self.wid, csce, ve, backtrace=True)
             self._csc_encoder = None

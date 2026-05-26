@@ -253,17 +253,11 @@ class GLWindowBackingBase(WindowBackingBase):
         "RGB", "BGR",
     )
     HAS_ALPHA: bool = GL_ALPHA_SUPPORTED
-    # Formats rendered via GL shaders that are opaque despite having "A" in the name.
-    # The base class alpha filter strips any format containing "A", which would
-    # incorrectly remove these from non-alpha windows.
-    _OPAQUE_SHADER_FORMATS: frozenset = frozenset(("AYUV", ))
+    # AYUV from VPL HEVC RExt 4:4:4 carries A=0xFF (always opaque) —
+    # available on non-alpha windows via the base-class OPAQUE_FORMATS_WITH_A
+    # exemption applied at all name-based filter sites.
+    OPAQUE_FORMATS_WITH_A: frozenset = frozenset({"AYUV"})
     _is_intel: bool | None = None  # cached across all windows
-
-    def get_rgb_formats(self) -> Sequence[str]:
-        if self._alpha_enabled:
-            return self.RGB_MODES
-        return tuple(x for x in self.RGB_MODES
-                     if x.find("A") < 0 or x in self._OPAQUE_SHADER_FORMATS)
 
     def __init__(self, wid: int, window_alpha: bool, pixel_depth: int = 0):
         self.wid: int = wid

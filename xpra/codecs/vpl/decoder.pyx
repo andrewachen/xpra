@@ -157,6 +157,24 @@ def init_module(options: dict = None) -> None:
         raise ImportError("oneVPL startup failed: %s" %
                           vpl_decode_status_str(status).decode("latin-1"))
     log("vpl: oneVPL startup ok")
+    # Symmetric with cleanup_module: bump the generation AND free any
+    # parked context. The bump invalidates snapshots taken by Decoders
+    # still in flight from a prior generation (their clean() will
+    # destroy instead of re-park). The destroy frees an orphan that
+    # parked in the narrow window between cleanup_module dropping the
+    # lock and this init_module — a concurrent init_context could have
+    # snapped the post-cleanup generation, then parked on clean. Cache
+    # is empty at every init.
+    global _cache_generation, _cached_context
+    cdef VPLDecoder *to_destroy = NULL
+    with _cache_lock:
+        _cache_generation += 1
+        if _cached_context != NULL:
+            to_destroy = _cached_context
+            _cached_context = NULL
+    if to_destroy != NULL:
+        with nogil:
+            vpl_decoder_destroy(to_destroy)
     _probe_hardware_accel()
 
 

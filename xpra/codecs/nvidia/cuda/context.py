@@ -521,7 +521,7 @@ def free_default_device_context() -> None:
 
 
 class cuda_device_context:
-    __slots__ = ("device_id", "device", "context", "lock", "opengl")
+    __slots__ = ("device_id", "device", "context", "lock", "opengl", "_holder_id", "_holder_phase")
 
     def __init__(self, device_id: int, device, opengl=False):
         assert device, "no cuda device"
@@ -530,14 +530,24 @@ class cuda_device_context:
         self.opengl = opengl
         self.context = None
         self.lock = RLock()
+        self._holder_phase: str = ""   # "init" / "cleanup" / "compress" / ""
+        self._holder_id: str = ""      # short identifier of the encoder holding the lock
         log("%r", self)
+
+    def set_holder(self, holder_id: str, phase: str) -> None:
+        """Called by acquirers right after they win the lock. Cleared on release."""
+        self._holder_id = holder_id
+        self._holder_phase = phase
 
     def __bool__(self):
         return self.device is not None
 
     def __enter__(self):
         if not self.lock.acquire(False):
-            raise TransientCodecException("failed to acquire cuda device lock")
+            raise TransientCodecException(
+                "failed to acquire cuda device lock "
+                f"(held by {self._holder_id or '?'} during {self._holder_phase or '?'})"
+            )
         if not self.context:
             self.make_context()
         return self.push_context()
@@ -560,6 +570,8 @@ class cuda_device_context:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.pop_context()
+        self._holder_id = ""
+        self._holder_phase = ""
         self.lock.release()
 
     def pop_context(self) -> None:

@@ -593,6 +593,7 @@ cdef class Encoder:
         global bad_presets
         cdef double start = monotonic()
         with self.cuda_device_context as cuda_context:
+            self.cuda_device_context.set_holder(self._cdc_holder_id(), "init")
             self.init_cuda(cuda_context)
             self.init_cuda_kernel(cuda_context)
 
@@ -1170,6 +1171,7 @@ cdef class Encoder:
             # time and do_clean runs on a daemon thread, so waiting is
             # safe — strictly preferable to leaking.
             cdc.lock.acquire()
+            cdc.set_holder(self._cdc_holder_id(), "cleanup")
             try:
                 if cdc.context:
                     cdc.context.push()
@@ -1180,6 +1182,8 @@ cdef class Encoder:
                         cdc.context.pop()
                 self.cuda_device_context = None
             finally:
+                cdc._holder_id = ""
+                cdc._holder_phase = ""
                 cdc.lock.release()
         self.width = 0
         self.height = 0
@@ -1296,6 +1300,10 @@ cdef class Encoder:
     def get_encoding(self) -> str:
         return self.encoding
 
+    def _cdc_holder_id(self) -> str:
+        # short, log-safe identifier for the lock-holder diagnostic
+        return f"nvenc-codec={self.codec_name}"
+
     def get_src_format(self) -> str:
         return self.src_format
 
@@ -1371,6 +1379,7 @@ cdef class Encoder:
             raise RuntimeError("no cuda device context")
         # cuda_device_context.__enter__ does self.context.push()
         with cuda_device_context as cuda_context:
+            cuda_device_context.set_holder(self._cdc_holder_id(), "compress")
             quality = options.get("quality", -1)
             if quality>=0:
                 self.set_encoding_quality(quality)

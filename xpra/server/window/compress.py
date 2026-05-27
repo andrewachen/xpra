@@ -34,6 +34,7 @@ from xpra.codecs.loader import get_codec
 from xpra.codecs.image import ImageWrapper
 from xpra.codecs.constants import (
     preforder,
+    ALPHA_FORMATS,
     LOSSY_PIXEL_FORMATS, PREFERRED_REFRESH_ENCODING_ORDER,
     PSEUDO_LOSSLESS_ENCODINGS, TRUE_LOSSLESS_ENCODINGS, COMPRESS_FMT, COMPRESS_FMT_DIRECT,
 )
@@ -825,7 +826,7 @@ class WindowSource(WindowIconSource):
         rgb_formats = properties.strtupleget("encodings.rgb_formats", self.rgb_formats)
         if not self.supports_transparency:
             # remove rgb formats with alpha
-            rgb_formats = tuple(x for x in rgb_formats if x.find("A") < 0)
+            rgb_formats = tuple(x for x in rgb_formats if x not in ALPHA_FORMATS)
         self.rgb_formats = rgb_formats
         self.send_window_size = properties.boolget("encoding.send-window-size", self.send_window_size)
         self.parse_csc_modes(properties.dictget("encoding.full_csc_modes", default=None))

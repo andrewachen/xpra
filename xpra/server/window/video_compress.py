@@ -216,6 +216,8 @@ class WindowVideoSource(WindowSource):
         self.last_pipeline_scores : tuple = ()
         self.last_pipeline_time: float = 0.0
         self.reinit_count: int = 0
+        self._last_candidate_space: tuple | None = None
+        self._consecutive_encode_failures: int = 0
 
         self.video_subregion = VideoSubregion(self.refresh_subregion, self.auto_refresh_delay, VIDEO_SUBREGION)
         self.video_subregion.supported = VIDEO_SUBREGION
@@ -1849,6 +1851,78 @@ class WindowVideoSource(WindowSource):
         scalinglog("calculate_scaling%s=%s (q=%s, s=%s, scaling_control=%s)",
                    (width, height, max_w, max_h), scaling, q, s, self.scaling_control)
         return scaling
+
+    def _compute_candidate_pixel_format_fingerprint(self) -> frozenset:
+        """Per-candidate target pixel format map, hashed.
+
+        For each candidate in common_video_encodings, compute whether it
+        would target YUV444P at the current quality, with Y2 deadband
+        applied based on the CURRENT encoder's pixel format. Returns a
+        frozenset of (encoding, target_pixel_format) pairs.
+        """
+        try:
+            from xpra.codecs.nvidia.nvenc.encoder import YUV444_CODEC_SUPPORT
+        except ImportError:
+            YUV444_CODEC_SUPPORT = {}
+        # XPRA_NVENC_YUV444_THRESHOLD mirrors the cdef int constant in
+        # encoder.pyx (keep defaults in sync). YUV444_DEADBAND is a new
+        # env var introduced for R2's Y2 hysteresis; encoder.pyx's
+        # equivalent is wired in Task 15.
+        yuv444_threshold = envint("XPRA_NVENC_YUV444_THRESHOLD", 85)
+        yuv444_deadband = envint("XPRA_NVENC_YUV444_DEADBAND", 5)
+        try:
+            current_pf = self._video_encoder.get_src_format() if self._video_encoder else None
+        except AttributeError:
+            current_pf = None
+        currently_yuv444 = (current_pf == "YUV444P")
+        if currently_yuv444:
+            yuv444_active = self._current_quality >= (yuv444_threshold - yuv444_deadband)
+        else:
+            yuv444_active = self._current_quality >= yuv444_threshold
+        entries = []
+        for encoding in self.common_video_encodings:
+            # YUV444_CODEC_SUPPORT keys are the actual nvenc encoding names
+            # (h264, h265 — NOT 'hevc'). av1 has False by default. Anything
+            # outside the dict is non-nvenc and uses its own input pixel format.
+            if YUV444_CODEC_SUPPORT.get(encoding, False):
+                target_pf = "YUV444P" if yuv444_active else "NV12"
+            elif encoding in YUV444_CODEC_SUPPORT:
+                # Known to nvenc but YUV444-incapable → always NV12 for these
+                target_pf = "NV12"
+            else:
+                target_pf = self.pixel_format
+            entries.append((encoding, target_pf))
+        return frozenset(entries)
+
+    def _compute_desired_scaling(self) -> tuple[int, int]:
+        """Fresh output of calculate_scaling for current state.
+        NOT self.actual_scaling, which describes the installed pipeline (lags reality)."""
+        ww, wh = self.window_dimensions
+        w = ww & self.width_mask
+        h = wh & self.height_mask
+        vs = self.video_subregion
+        if vs and vs.rectangle:
+            r = vs.rectangle
+            w = r.width & self.width_mask
+            h = r.height & self.height_mask   # NOT width_mask; existing code at
+                                              # video_compress.py:1399 has the same typo
+                                              # but the right mask for height is height_mask
+        return self.calculate_scaling(w, h, self.max_w, self.max_h)
+
+    def _compute_candidate_space(self) -> tuple:
+        """Tuple R1 compares against the cached last_candidate_space to decide
+        whether scoring needs to re-run."""
+        return (
+            self.encoding,
+            self.content_type,
+            tuple(self.common_video_encodings),
+            self.pixel_format,
+            self.window_dimensions,
+            self.video_subregion.rectangle if self.video_subregion else None,
+            tuple(sorted(self.full_csc_modes.items())) if self.full_csc_modes else (),
+            self._compute_candidate_pixel_format_fingerprint(),
+            self._compute_desired_scaling(),
+        )
 
     def check_pipeline(self, encodings: Sequence[str], width: int, height: int, src_format: str) -> bool:
         """

@@ -17,7 +17,7 @@ from types import FrameType
 from xpra.scripts.config import InitExit
 from xpra.common import (
     FULL_INFO, LOG_HELLO,
-    ConnectionMessage, disconnect_is_an_error, noerr, NotificationID, noop,
+    ConnectionMessage, disconnect_is_an_error, noerr, NotificationID, noop, stop_asyncio_loop,
 )
 from xpra.net import compression
 from xpra.net.common import Packet, PacketElement
@@ -400,6 +400,7 @@ class XpraClientBase(ClientBaseClass):
             self._protocol = None
             log("calling %s", p.close)
             p.close()
+        stop_asyncio_loop()
         log("cleanup done")
 
     def run(self) -> ExitValue:

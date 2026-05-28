@@ -6,6 +6,7 @@
 import time
 import asyncio
 from typing import Any
+from threading import Lock
 from collections.abc import Awaitable, Callable
 
 from queue import SimpleQueue
@@ -72,7 +73,7 @@ class ThreadedAsyncioLoop:
 
     def __init__(self):
         self.loop: asyncio.AbstractEventLoop | None = None
-        start_thread(self.run_forever, "asyncio-thread", True)
+        self.thread = start_thread(self.run_forever, "asyncio-thread", True)
         self.wait_for_loop()
 
     def run_forever(self) -> None:
@@ -84,7 +85,8 @@ class ThreadedAsyncioLoop:
         asyncio.set_event_loop(loop)
         self.loop = loop
         self.loop.run_forever()
-        self.loop.close()
+        self.loop = None
+        loop.close()
 
     def wait_for_loop(self) -> None:
         now = monotonic()
@@ -114,6 +116,13 @@ class ThreadedAsyncioLoop:
             self.loop.call_soon_threadsafe(tsafe)
         else:
             self.loop.call_soon_threadsafe(f)
+
+    def stop(self) -> None:
+        loop = self.loop
+        log(f"stop() loop={loop}")
+        if not loop or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(loop.stop)
 
     def sync(self, async_fn: Callable[..., Awaitable[Any]], *args) -> Any:
         response: SimpleQueue[Any] = SimpleQueue()
@@ -156,10 +165,23 @@ class ThreadedAsyncioLoop:
 
 
 singleton: ThreadedAsyncioLoop | None = None
+lock = Lock()
 
 
 def get_threaded_loop() -> ThreadedAsyncioLoop:
     global singleton
-    if not singleton:
-        singleton = ThreadedAsyncioLoop()
-    return singleton
+    with lock:
+        if not singleton:
+            singleton = ThreadedAsyncioLoop()
+    loop = singleton
+    assert loop is not None  # redundant at runtime, but satisfies the type checker
+    return loop
+
+
+def stop_threaded_loop() -> None:
+    global singleton
+    with lock:
+        threaded_loop = singleton
+        singleton = None
+    if threaded_loop:
+        threaded_loop.stop()

@@ -315,6 +315,38 @@ async def get_address_options(host: str, port: int) -> tuple:
     return tuple(infos)
 
 
+async def _watch_handshake(protocol: QuicConnectionProtocol, conn, timeout: float) -> None:
+    # Background watcher for fast-open connects: wait for the QUIC/TLS handshake
+    # to complete (or fail) without blocking the caller, so the first user write
+    # still rides the same flight as the ClientHello (preserving the fast-open RTT
+    # saving). If the handshake fails — either by timeout or by the server sending
+    # a CRYPTO_ERROR (e.g. cert hostname mismatch) — we surface a meaningful
+    # ExitCode via conn.handshake_failed() so the blocked read() raises InitExit
+    # instead of timing out at the higher layer.
+    try:
+        await asyncio.wait_for(protocol.wait_connected(), timeout=timeout)
+        log("fast-open handshake watcher: connected")
+        return
+    except asyncio.TimeoutError:
+        log("fast-open handshake watcher: timed out")
+    except Exception as e:
+        log(f"fast-open handshake watcher: wait_connected raised {e!r}")
+    quic_conn = getattr(protocol, "_quic", None)
+    close_event = getattr(quic_conn, "_close_event", None) if quic_conn else None
+    if close_event is not None:
+        err = close_event.error_code
+        msg = close_event.reason_phrase or ""
+        log(f"fast-open handshake watcher: close_event error=0x{err:x} reason={msg!r}")
+        if err & QuicErrorCode.CRYPTO_ERROR:
+            conn.handshake_failed(ExitCode.SSL_CERTIFICATE_VERIFY_FAILURE,
+                                  msg or "SSL certificate verification failed")
+            return
+        conn.handshake_failed(ExitCode.CONNECTION_FAILED,
+                              msg or f"QUIC connection closed with error 0x{err:x}")
+        return
+    conn.handshake_failed(ExitCode.CONNECTION_FAILED, "QUIC handshake timed out")
+
+
 def quic_connect(host: str, port: int, path: str, fast_open: bool,
                  ssl_cert: str, ssl_key: str, ssl_key_password: str,
                  ssl_ca_certs, ssl_server_verify_mode: str, ssl_server_name: str):
@@ -402,7 +434,14 @@ def quic_connect(host: str, port: int, path: str, fast_open: bool,
             # check for TLS errors that arrived before we started waiting
             if protocol._tls_error:
                 raise protocol._tls_error
-            await asyncio.wait_for(protocol.wait_connected(), timeout=CONNECT_TIMEOUT)
+            if fast_open:
+                # don't block the caller — schedule a background watcher so the
+                # first user write still rides the same flight as the ClientHello.
+                # Handshake failures (timeout / CRYPTO_ERROR) are surfaced via
+                # conn.handshake_failed which makes the blocked read() raise InitExit.
+                asyncio.ensure_future(_watch_handshake(protocol, conn, CONNECT_TIMEOUT))
+            else:
+                await asyncio.wait_for(protocol.wait_connected(), timeout=CONNECT_TIMEOUT)
         except asyncio.TimeoutError:
             # check if a TLS error was captured before the timeout
             if protocol._tls_error:

@@ -809,12 +809,12 @@ class WindowVideoSource(WindowSource):
 
     def quality_changed(self, window, *args) -> bool:
         super().quality_changed(window, args)
-        self.video_context_clean()
+        self._maybe_invalidate_for_operating_point()
         return True
 
     def speed_changed(self, window, *args) -> bool:
         super().speed_changed(window, args)
-        self.video_context_clean()
+        self._maybe_invalidate_for_operating_point()
         return True
 
     def client_decode_error(self, error: int | float, message: str) -> None:
@@ -1958,6 +1958,16 @@ class WindowVideoSource(WindowSource):
             ve.set_encoding_speed(self._current_speed)
         except AttributeError:
             pass
+
+    def _maybe_invalidate_for_operating_point(self) -> None:
+        """Called by quality_changed/speed_changed (client-driven property
+        notifies). Tear down only if the candidate space genuinely changed."""
+        new_space = self._compute_candidate_space()
+        if new_space != self._last_candidate_space:
+            self.video_context_clean()
+            self._last_candidate_space = new_space
+        else:
+            self._push_operating_point()
 
     def check_pipeline(self, encodings: Sequence[str], width: int, height: int, src_format: str) -> bool:
         """

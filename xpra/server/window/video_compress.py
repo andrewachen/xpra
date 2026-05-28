@@ -1344,11 +1344,30 @@ class WindowVideoSource(WindowSource):
         """
         super().update_encoding_options(force_reload)
         self.update_encoding_video_subregion()
+        new_space = self._compute_candidate_space()
+        space_changed = (new_space != self._last_candidate_space)
         if force_reload:
             self.cleanup_codecs()
-        self.update_pipeline_scores(force_reload)
-        if not self.verify_csc_and_encoder() and not force_reload:
-            self.cleanup_codecs()
+        if space_changed or force_reload:
+            # Snapshot the score-set REFERENCE (not id) to detect whether
+            # update_pipeline_scores actually refreshed (it may throttle
+            # internally — see last_pipeline_params throttle in that method).
+            # `is not` reference comparison avoids the empty-tuple intern trap
+            # that `id()` falls into when update_pipeline_scores cancels
+            # mid-run and assigns self.last_pipeline_scores = ().
+            prev_scores = self.last_pipeline_scores
+            self.update_pipeline_scores(force_reload)
+            scores_refreshed = (self.last_pipeline_scores is not prev_scores) or force_reload
+            if scores_refreshed:
+                # Only advance the cache when fresh scores actually landed,
+                # so a throttle-induced no-op doesn't mark the space "handled".
+                self._last_candidate_space = new_space
+                if not self.verify_csc_and_encoder() and not force_reload:
+                    self.cleanup_codecs()
+            # else: scoring throttled, leave cache stale — next tick retries
+        else:
+            # candidate space unchanged — push operating-point only
+            self._push_operating_point()
         self._last_pipeline_check = monotonic()
 
     def update_pipeline_scores(self, force_reload=False) -> None:

@@ -11,6 +11,7 @@ import socket
 from typing import Any
 from collections.abc import Callable
 
+from xpra.exit_codes import ExitCode
 from xpra.net.common import ConnectionClosedException, IP_SOCKTYPES, TCP_SOCKTYPES, get_peercred_info
 from xpra.util.str_fn import csv
 from xpra.util.env import hasenv, envint, envbool, SilenceWarningsContext
@@ -143,6 +144,9 @@ class Connection:
         self.filename = None  # only used for unix domain sockets!
         self.active = True
         self.timeout = 0
+        # transports can set this when a connection-fatal error is detected
+        # so the connection's owner can report the right exit code:
+        self.error: ExitCode = ExitCode.OK
 
     def set_nodelay(self, nodelay: bool) -> None:
         """ TCP sockets override this method  """

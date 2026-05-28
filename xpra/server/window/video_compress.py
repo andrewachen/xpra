@@ -1924,6 +1924,22 @@ class WindowVideoSource(WindowSource):
             self._compute_desired_scaling(),
         )
 
+    def _push_operating_point(self) -> None:
+        """Push current quality/speed to the active video encoder without
+        triggering teardown or re-scoring. R1 calls this when the candidate
+        space is unchanged."""
+        ve = self._video_encoder
+        if ve is None:
+            return
+        try:
+            ve.set_encoding_quality(self._current_quality)
+        except AttributeError:
+            pass
+        try:
+            ve.set_encoding_speed(self._current_speed)
+        except AttributeError:
+            pass
+
     def check_pipeline(self, encodings: Sequence[str], width: int, height: int, src_format: str) -> bool:
         """
             Checks that the current pipeline is still valid

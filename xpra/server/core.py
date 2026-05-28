@@ -55,7 +55,7 @@ from xpra.util.background_worker import add_work_item, quit_worker
 from xpra.util.thread import start_thread
 from xpra.common import (
     LOG_HELLO, FULL_INFO, DEFAULT_XDG_DATA_DIRS,
-    noop, ConnectionMessage, noerr, init_memcheck, subsystem_name,
+    noop, ConnectionMessage, noerr, init_memcheck, subsystem_name, stop_asyncio_loop,
 )
 from xpra.util.pysystem import dump_all_frames
 from xpra.util.objects import typedict
@@ -351,6 +351,7 @@ class ServerCore(ServerBaseClass):
         self.cleanup_all_protocols()
         self.do_cleanup()
         self.cleanup_sockets()
+        stop_asyncio_loop()
         netlog("cleanup() done for server core")
 
     def do_cleanup(self) -> None:

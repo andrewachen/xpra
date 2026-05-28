@@ -103,6 +103,7 @@ SAVE_TO_FILE = os.environ.get("XPRA_SAVE_TO_FILE", "") or os.environ.get("XPRA_N
 
 cdef int SUPPORT_30BPP = envbool("XPRA_NVENC_SUPPORT_30BPP", True)
 cdef int YUV444_THRESHOLD = envint("XPRA_NVENC_YUV444_THRESHOLD", 85)
+cdef int YUV444_DEADBAND = envint("XPRA_NVENC_YUV444_DEADBAND", 5)
 cdef int LOSSLESS_THRESHOLD = envint("XPRA_NVENC_LOSSLESS_THRESHOLD", 100)
 cdef int NATIVE_RGB = envbool("XPRA_NVENC_NATIVE_RGB", int(not WIN32))
 cdef int LOSSLESS_ENABLED = envbool("XPRA_NVENC_LOSSLESS", True)
@@ -620,7 +621,7 @@ cdef class Encoder:
         return bool(self.ready)
 
     def get_target_pixel_format(self, int quality) -> str:
-        global NATIVE_RGB, YUV420_ENABLED, YUV444_ENABLED, LOSSLESS_ENABLED, YUV444_THRESHOLD, YUV444_CODEC_SUPPORT
+        global NATIVE_RGB, YUV420_ENABLED, YUV444_ENABLED, LOSSLESS_ENABLED, YUV444_THRESHOLD, YUV444_DEADBAND, YUV444_CODEC_SUPPORT
         v = ""
         hasyuv444 = YUV444_CODEC_SUPPORT.get(self.encoding, YUV444_ENABLED) and "YUV444P" in self.dst_formats
         nativergb = NATIVE_RGB and hasyuv444
@@ -634,7 +635,16 @@ cdef class Encoder:
                 #NVENC and the client can handle it,
                 #now check quality and scaling:
                 #(don't use YUV444 is we're going to downscale or use low quality anyway)
-                if (quality>=YUV444_THRESHOLD and not self.scaling) or not hasyuv420:
+                #Y2 hysteresis: stay in YUV444P until quality drops below
+                #(YUV444_THRESHOLD - YUV444_DEADBAND); switch up at the raw
+                #threshold. Prevents flapping around the boundary that would
+                #otherwise force a teardown (pixel-format changes can't be
+                #handled via nvEncReconfigureEncoder).
+                if self.pixel_format == "YUV444P":
+                    upcross = YUV444_THRESHOLD - YUV444_DEADBAND
+                else:
+                    upcross = YUV444_THRESHOLD
+                if (quality>=upcross and not self.scaling) or not hasyuv420:
                     v = "YUV444P"
             if not v:
                 if hasyuv420:
@@ -1048,6 +1058,7 @@ cdef class Encoder:
             "yuv444" : {
                         "supported" : YUV444_CODEC_SUPPORT.get(self.encoding, YUV444_ENABLED),
                         "threshold" : YUV444_THRESHOLD,
+                        "deadband"  : YUV444_DEADBAND,
                         },
             "cuda-device"   : self.cuda_device_info or {},
             "cuda"          : self.cuda_info or {},

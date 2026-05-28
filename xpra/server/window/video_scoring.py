@@ -111,8 +111,12 @@ def get_pipeline_score(enc_in_format: str, csc_spec: CSCSpec | None, encoder_spe
     sscore = get_speed_score(enc_in_format, csc_spec, encoder_spec, scaling, target_speed, min_speed)
 
     # multiplier for setup_cost:
-    # (lose points if we have less than N fps)
-    setup_cost_mult = int(detection) * (1 + max(0, MIN_FPS_COST - ffps))
+    # The base term ALWAYS applies — switching from a current encoder is
+    # real cost regardless of whether video subregion detection is active.
+    # The `detection` factor only adds extra weight to the fps-based bump,
+    # preserving the prior intent for subregion-detection scenarios.
+    # See the nvenc reinit-storm design spec (R2).
+    setup_cost_mult = 1 + int(detection) * max(0, MIN_FPS_COST - ffps)
 
     # how well the codec deals with larger screen sizes:
     sizescore = 100

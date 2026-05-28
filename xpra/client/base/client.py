@@ -472,7 +472,10 @@ class XpraClientBase(ClientBaseClass):
 
     def _process_connection_lost(self, _packet: Packet) -> None:
         p = self._protocol
-        if p and p.input_raw_packetcount == 0:
+        transport_error = getattr(p, "error", ExitCode.OK)
+        if transport_error != ExitCode.OK:
+            exit_code = transport_error
+        elif p and p.input_raw_packetcount == 0:
             props = p.get_info()
             c = props.get("compression", "unknown")
             e = props.get("encoder", "rencodeplus")

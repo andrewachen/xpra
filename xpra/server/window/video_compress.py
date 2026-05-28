@@ -187,6 +187,8 @@ class WindowVideoSource(WindowSource):
         A WindowSource that handles video codecs.
     """
 
+    R1_FORCE_RESELECT_AFTER: int = envint("XPRA_R1_FORCE_RESELECT_AFTER", 5)
+
     def __init__(self, *args):
         self.supports_scrolling: bool = False
         # this will call init_vars():
@@ -1969,6 +1971,20 @@ class WindowVideoSource(WindowSource):
         else:
             self._push_operating_point()
 
+    def _r1_note_encode_outcome(self, success: bool) -> None:
+        """Called from the encode path. After N consecutive failures, force
+        R1 to re-score on the next update_encoding_options."""
+        if success:
+            self._consecutive_encode_failures = 0
+            return
+        self._consecutive_encode_failures += 1
+        if self._consecutive_encode_failures >= self.R1_FORCE_RESELECT_AFTER:
+            log.warn("forcing encoder re-selection after %i consecutive failures",
+                     self._consecutive_encode_failures)
+            self.video_context_clean()
+            self._last_candidate_space = None  # force re-score on next call
+            self._consecutive_encode_failures = 0
+
     def check_pipeline(self, encodings: Sequence[str], width: int, height: int, src_format: str) -> bool:
         """
             Checks that the current pipeline is still valid
@@ -2672,6 +2688,7 @@ class WindowVideoSource(WindowSource):
             if csce:
                 videolog.error(" csc %s:", csce.get_type())
                 print_nested_dict(csce.get_info(), prefix="   ", print_fn=videolog.error)
+            self._r1_note_encode_outcome(False)
             return self.video_fallback(image, options, warn=False, info=f"compression failure: {e}")
         finally:
             if image != csc_image:
@@ -2680,6 +2697,7 @@ class WindowVideoSource(WindowSource):
         if not ret:
             if not self.is_cancelled():
                 videolog.error("Error: %s video compression failed", encoding)
+            self._r1_note_encode_outcome(False)
             return self.video_fallback(image, options, warn=True, info="no data")
         data, client_options = ret
         end = monotonic()
@@ -2743,6 +2761,7 @@ class WindowVideoSource(WindowSource):
                 return self.video_fallback(image, options, info=f"encoder {ve.get_type()} is closed")
             videolog.error("Error: %s video data is missing", encoding)
             return ()
+        self._r1_note_encode_outcome(True)
         return actual_encoding, Compressed(actual_encoding, data), client_options, width, height, 0, 24
 
     def cancel_video_encoder_flush(self) -> None:

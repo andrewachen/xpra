@@ -164,5 +164,43 @@ class UpdateEncodingOptionsGateTest(unittest.TestCase):
         wvs.cancel_video_encoder_flush.assert_called()
 
 
+class SafetyValveTest(unittest.TestCase):
+
+    def _make_wvs(self):
+        from xpra.server.window.video_compress import WindowVideoSource
+        wvs = WindowVideoSource.__new__(WindowVideoSource)
+        wvs.reinit_count = 0
+        wvs._csc_encoder = None
+        wvs._video_encoder = None
+        wvs.wid = 1
+        wvs._consecutive_encode_failures = 0
+        wvs._last_candidate_space = ("placeholder",)
+        wvs.call_in_encode_thread = MagicMock()
+        return wvs
+
+    def test_success_resets_counter(self):
+        wvs = self._make_wvs()
+        wvs._consecutive_encode_failures = 3
+        wvs._r1_note_encode_outcome(True)
+        self.assertEqual(wvs._consecutive_encode_failures, 0)
+
+    def test_failure_below_threshold_does_not_invalidate(self):
+        wvs = self._make_wvs()
+        for _ in range(wvs.R1_FORCE_RESELECT_AFTER - 1):
+            wvs._r1_note_encode_outcome(False)
+        self.assertEqual(wvs._consecutive_encode_failures,
+                         wvs.R1_FORCE_RESELECT_AFTER - 1)
+        self.assertEqual(wvs._last_candidate_space, ("placeholder",),
+                         "candidate space cache must persist")
+
+    def test_failure_at_threshold_invalidates(self):
+        wvs = self._make_wvs()
+        for _ in range(wvs.R1_FORCE_RESELECT_AFTER):
+            wvs._r1_note_encode_outcome(False)
+        self.assertEqual(wvs._consecutive_encode_failures, 0)
+        self.assertIsNone(wvs._last_candidate_space,
+                          "safety valve must invalidate cache")
+
+
 if __name__ == "__main__":
     unittest.main()

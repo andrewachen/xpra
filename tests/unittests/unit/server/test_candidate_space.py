@@ -166,12 +166,16 @@ class UpdateEncodingOptionsGateTest(unittest.TestCase):
 
 class SafetyValveTest(unittest.TestCase):
 
-    def _make_wvs(self):
+    def _make_wvs(self, with_encoders=False):
         from xpra.server.window.video_compress import WindowVideoSource
         wvs = WindowVideoSource.__new__(WindowVideoSource)
         wvs.reinit_count = 0
-        wvs._csc_encoder = None
-        wvs._video_encoder = None
+        if with_encoders:
+            wvs._csc_encoder = MagicMock()
+            wvs._video_encoder = MagicMock()
+        else:
+            wvs._csc_encoder = None
+            wvs._video_encoder = None
         wvs.wid = 1
         wvs._consecutive_encode_failures = 0
         wvs._last_candidate_space = ("placeholder",)
@@ -194,12 +198,51 @@ class SafetyValveTest(unittest.TestCase):
                          "candidate space cache must persist")
 
     def test_failure_at_threshold_invalidates(self):
-        wvs = self._make_wvs()
+        wvs = self._make_wvs(with_encoders=True)
+        csce = wvs._csc_encoder
+        ve = wvs._video_encoder
         for _ in range(wvs.R1_FORCE_RESELECT_AFTER):
             wvs._r1_note_encode_outcome(False)
         self.assertEqual(wvs._consecutive_encode_failures, 0)
         self.assertIsNone(wvs._last_candidate_space,
                           "safety valve must invalidate cache")
+        # cleanup must happen synchronously on the calling (encode) thread
+        # so no queued damage work can open a replacement before the
+        # failed encoder is torn down.
+        self.assertIsNone(wvs._video_encoder,
+                          "safety valve must null _video_encoder")
+        self.assertIsNone(wvs._csc_encoder,
+                          "safety valve must null _csc_encoder")
+        csce.clean.assert_called_once()
+        ve.clean.assert_called_once()
+        # reinit_count must be bumped (semantic equivalent to video_context_clean)
+        self.assertEqual(wvs.reinit_count, 1,
+                         "reinit_count must bump on safety-valve cleanup")
+        # cleanup is synchronous, not deferred via call_in_encode_thread
+        wvs.call_in_encode_thread.assert_not_called()
+
+    def test_failure_at_threshold_with_no_encoders(self):
+        # If both encoders are already None, the valve still resets state
+        # but does not bump reinit_count.
+        wvs = self._make_wvs(with_encoders=False)
+        for _ in range(wvs.R1_FORCE_RESELECT_AFTER):
+            wvs._r1_note_encode_outcome(False)
+        self.assertEqual(wvs._consecutive_encode_failures, 0)
+        self.assertIsNone(wvs._last_candidate_space)
+        self.assertEqual(wvs.reinit_count, 0)
+
+    def test_cleanup_exception_does_not_propagate(self):
+        # If .clean() raises, the safety valve must still complete:
+        # we are explicitly cleaning a possibly-bad encoder.
+        wvs = self._make_wvs(with_encoders=True)
+        wvs._video_encoder.clean.side_effect = RuntimeError("boom")
+        wvs._csc_encoder.clean.side_effect = RuntimeError("kaboom")
+        # Should not raise.
+        for _ in range(wvs.R1_FORCE_RESELECT_AFTER):
+            wvs._r1_note_encode_outcome(False)
+        self.assertIsNone(wvs._video_encoder)
+        self.assertIsNone(wvs._csc_encoder)
+        self.assertIsNone(wvs._last_candidate_space)
 
 
 if __name__ == "__main__":

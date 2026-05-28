@@ -1981,7 +1981,29 @@ class WindowVideoSource(WindowSource):
         if self._consecutive_encode_failures >= self.R1_FORCE_RESELECT_AFTER:
             log.warn("forcing encoder re-selection after %i consecutive failures",
                      self._consecutive_encode_failures)
-            self.video_context_clean()
+            # We are already on the encode thread. Clean the failed encoder
+            # synchronously rather than via video_context_clean()'s deferred
+            # path: any damage work already queued ahead would otherwise run
+            # first, see _video_encoder is None, and open a replacement while
+            # the failed NVENC session is still alive.
+            csce = self._csc_encoder
+            ve = self._video_encoder
+            if csce or ve:
+                self._csc_encoder = None
+                self._video_encoder = None
+                self.reinit_count += 1
+                if csce:
+                    try:
+                        csce.clean()
+                    except Exception:
+                        videolog.warn("Warning: csc_encoder cleanup during safety valve failed",
+                                      exc_info=True)
+                if ve:
+                    try:
+                        ve.clean()
+                    except Exception:
+                        videolog.warn("Warning: video_encoder cleanup during safety valve failed",
+                                      exc_info=True)
             self._last_candidate_space = None  # force re-score on next call
             self._consecutive_encode_failures = 0
 
@@ -2760,6 +2782,7 @@ class WindowVideoSource(WindowSource):
                 self.video_context_clean()
                 return self.video_fallback(image, options, info=f"encoder {ve.get_type()} is closed")
             videolog.error("Error: %s video data is missing", encoding)
+            self._r1_note_encode_outcome(False)
             return ()
         self._r1_note_encode_outcome(True)
         return actual_encoding, Compressed(actual_encoding, data), client_options, width, height, 0, 24

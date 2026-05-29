@@ -416,7 +416,6 @@ cdef class Encoder:
     cdef NV_ENC_INITIALIZE_PARAMS _cached_init_params
     cdef NV_ENC_CONFIG *_cached_encode_config
     cdef int _cached_init_params_valid
-    cdef GUID _cached_preset_guid
 
     cdef GUID init_codec(self) except *:
         log("init_codec()")
@@ -805,6 +804,10 @@ cdef class Encoder:
             # Shallow-copy the outer struct, then deep-copy encodeConfig into our
             # own heap buffer. The finally below will free params.encodeConfig, so
             # we must not retain that pointer.
+            # Defensive: free any prior snapshot before overwriting.
+            if self._cached_encode_config != NULL:
+                free(self._cached_encode_config)
+                self._cached_encode_config = NULL
             memcpy(&self._cached_init_params, params, sizeof(NV_ENC_INITIALIZE_PARAMS))
             if params.encodeConfig != NULL:
                 self._cached_encode_config = <NV_ENC_CONFIG*> malloc(sizeof(NV_ENC_CONFIG))
@@ -814,7 +817,6 @@ cdef class Encoder:
             else:
                 self._cached_encode_config = NULL
                 self._cached_init_params.encodeConfig = NULL
-            self._cached_preset_guid = params.presetGUID
             self._cached_init_params_valid = 1
 
             self.dump_caps(self.codec_name, codec)

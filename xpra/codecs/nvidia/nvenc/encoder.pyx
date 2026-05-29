@@ -1385,6 +1385,7 @@ cdef class Encoder:
         return self.pixel_format or ""
 
     def set_encoding_speed(self, int speed) -> None:
+        assert self.context, "context is not initialized"
         if self.speed == speed:
             return
         cdef GUID new_preset
@@ -1480,9 +1481,15 @@ cdef class Encoder:
             reconfigure_params.forceIDR = force_idr
             with nogil:
                 r = self.functionList.nvEncReconfigureEncoder(self.context, &reconfigure_params)
-            raiseNVENC(r, "reconfiguring encoder")
-            log("nvEncReconfigureEncoder OK: target_bitrate=%i max_bitrate=%i",
-                self.target_bitrate, self.max_bitrate)
+            try:
+                raiseNVENC(r, "reconfiguring encoder")
+                log("nvEncReconfigureEncoder OK: target_bitrate=%i max_bitrate=%i",
+                    self.target_bitrate, self.max_bitrate)
+            except Exception as e:
+                # Reconfigure failure is non-fatal: cached init params remain
+                # valid, encoder remains live, next encode uses old bitrate.
+                # Next reconfigure attempt retries after the debounce window.
+                log.warn("Warning: nvenc reconfigure failed: %s", e)
         finally:
             if reconfigure_params.reInitEncodeParams.encodeConfig != NULL:
                 free(reconfigure_params.reInitEncodeParams.encodeConfig)

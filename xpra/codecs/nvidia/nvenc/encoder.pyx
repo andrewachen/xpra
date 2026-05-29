@@ -420,6 +420,11 @@ cdef class Encoder:
     cdef int _cached_init_params_valid
     cdef double _last_reconfigure_time
     cdef int _preset_unrecoverable
+    # Set by set_encoding_quality/set_encoding_speed when a bitrate-only
+    # reconfigure is needed. Drained by compress_image inside cdc.lock so
+    # nvEncReconfigureEncoder always runs on the encode thread, which already
+    # serializes encoder mutations and teardown.
+    cdef int _pending_reconfigure
 
     cdef GUID init_codec(self) except *:
         log("init_codec()")
@@ -1400,7 +1405,10 @@ cdef class Encoder:
             self._preset_unrecoverable = 1
             return
         self.update_bitrate()
-        self._apply_reconfigure(reset_encoder=1, force_idr=1)
+        # Defer the nvEncReconfigureEncoder call to the encode thread.
+        # compress_image drains this flag inside cdc.lock, which serializes
+        # encoder mutations with ongoing encodes and teardown.
+        self._pending_reconfigure = 1
 
     def set_encoding_quality(self, int quality) -> None:
         assert self.context, "context is not initialized"
@@ -1433,9 +1441,11 @@ cdef class Encoder:
                 quality, self.pixel_format, new_pixel_format,
                 self.lossless, new_lossless)
             return
-        # Bitrate-only change: push to live encoder.
+        # Bitrate-only change: defer the nvEncReconfigureEncoder call to the
+        # encode thread. compress_image drains this flag inside cdc.lock,
+        # which serializes encoder mutations with ongoing encodes and teardown.
         self.update_bitrate()
-        self._apply_reconfigure(reset_encoder=1, force_idr=1)
+        self._pending_reconfigure = 1
 
     cdef void update_bitrate(self):
         #use an exponential scale so for a 1Kx1K image (after scaling), roughly:
@@ -1485,6 +1495,10 @@ cdef class Encoder:
                 raiseNVENC(r, "reconfiguring encoder")
                 log("nvEncReconfigureEncoder OK: target_bitrate=%i max_bitrate=%i",
                     self.target_bitrate, self.max_bitrate)
+                # Clear the flag only on success. If the call was debounced
+                # (early return above) or fails here, leave the flag set so
+                # the next frame retries rather than silently discarding the update.
+                self._pending_reconfigure = 0
             except Exception as e:
                 # Reconfigure failure is non-fatal: cached init params remain
                 # valid, encoder remains live, next encode uses old bitrate.
@@ -1524,6 +1538,11 @@ cdef class Encoder:
             speed = options.get("speed", -1)
             if speed>=0:
                 self.set_encoding_speed(speed)
+            # Drain any pending bitrate reconfigure before encoding. We are
+            # already inside cdc.lock here, so nvEncReconfigureEncoder runs
+            # serialized with all other encoder mutations and teardown.
+            if self._pending_reconfigure:
+                self._apply_reconfigure(reset_encoder=1, force_idr=1)
             return self.do_compress_image(cuda_context, image)
 
     cdef Tuple do_compress_image(self, cuda_context, image: ImageWrapper):

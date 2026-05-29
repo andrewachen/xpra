@@ -114,6 +114,28 @@ class CandidateSpaceTest(unittest.TestCase):
         self.assertEqual(space1, space2,
                          "small quality nudges within band must not change candidate space")
 
+    def test_candidate_space_changes_crossing_lossless_threshold(self):
+        """Crossing the lossless threshold (default 100) must invalidate the
+        candidate space so R1 schedules teardown. nvEncReconfigureEncoder
+        cannot change lossless mode on a live encoder; only a full teardown
+        and re-init can switch between lossy and lossless presets."""
+        wvs = self._make_wvs(quality=95)
+        space_lossy = wvs._compute_candidate_space()
+        wvs._current_quality = 100
+        space_lossless = wvs._compute_candidate_space()
+        self.assertNotEqual(space_lossy, space_lossless,
+                            "crossing LOSSLESS_THRESHOLD must change candidate space")
+
+    def test_candidate_space_stable_within_lossless_mode(self):
+        """Quality nudges while already in lossless mode (quality >= 100) must
+        not change the candidate space — there is nothing further to reconfigure."""
+        wvs = self._make_wvs(quality=100)
+        space1 = wvs._compute_candidate_space()
+        wvs._current_quality = 100  # unchanged, sanity
+        space2 = wvs._compute_candidate_space()
+        self.assertEqual(space1, space2,
+                         "quality unchanged at lossless must leave candidate space stable")
+
     def test_desired_scaling_is_fresh(self):
         wvs = self._make_wvs()
         wvs.calculate_scaling = lambda w, h, mw, mh: (1, 2)

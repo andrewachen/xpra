@@ -1946,23 +1946,25 @@ class WindowVideoSource(WindowSource):
             tuple(sorted(self.full_csc_modes.items())) if self.full_csc_modes else (),
             self._compute_candidate_pixel_format_fingerprint(),
             self._compute_desired_scaling(),
+            # Lossless mode is determined solely by quality >= LOSSLESS_THRESHOLD
+            # (mirrors encoder.pyx get_target_lossless). A lossy→lossless transition
+            # requires teardown because nvEncReconfigureEncoder cannot change the
+            # lossless preset on a live encoder.
+            self._current_quality >= envint("XPRA_NVENC_LOSSLESS_THRESHOLD", 100),
         )
 
     def _push_operating_point(self) -> None:
-        """Push current quality/speed to the active video encoder without
-        triggering teardown or re-scoring. R1 calls this when the candidate
-        space is unchanged."""
-        ve = self._video_encoder
-        if ve is None:
-            return
-        try:
-            ve.set_encoding_quality(self._current_quality)
-        except AttributeError:
-            pass
-        try:
-            ve.set_encoding_speed(self._current_speed)
-        except AttributeError:
-            pass
+        """No-op placeholder retained so call sites in _maybe_invalidate_for_operating_point
+        and update_encoding_options compile without changes.
+
+        The encode thread (compress_image) already applies WindowSource quality/speed
+        updates on each frame via set_encoding_quality/set_encoding_speed, reading
+        options["quality"] and options["speed"] from the per-frame typedict. Those
+        setters set a _pending_reconfigure dirty flag rather than calling
+        nvEncReconfigureEncoder directly; compress_image drains the flag inside
+        cuda_device_context.lock. Calling the setters from the UI/timer thread
+        (which does not hold cdc.lock) would race with compress_image and teardown."""
+        return
 
     def _maybe_invalidate_for_operating_point(self) -> None:
         """Called by quality_changed/speed_changed (client-driven property

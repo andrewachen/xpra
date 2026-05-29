@@ -36,7 +36,7 @@ import numpy
 
 from libc.stdint cimport uintptr_t, uint8_t, uint16_t, uint32_t, uint64_t   # pylint: disable=syntax-error
 from libc.stdlib cimport free, malloc
-from libc.string cimport memset, memcpy
+from libc.string cimport memset, memcpy, memcmp
 
 from xpra.codecs.nvidia.nvenc.nvencode cimport init_nvencode_library, create_nvencode_instance, get_current_cuda_context
 
@@ -52,6 +52,7 @@ from xpra.codecs.nvidia.nvenc.api cimport (
     NV_ENC_PIC_FLAG_EOS, NV_ENC_PIC_FLAG_FORCEIDR, NV_ENC_PIC_FLAG_OUTPUT_SPSPPS,
     NV_ENCODE_API_FUNCTION_LIST,
     NV_ENC_INITIALIZE_PARAMS, NV_ENC_INITIALIZE_PARAMS_VER,
+    NV_ENC_RECONFIGURE_PARAMS, NV_ENC_RECONFIGURE_PARAMS_VER,
     NV_ENC_REGISTERED_PTR,
     NV_ENC_BUFFER_FORMAT, NV_ENC_BUFFER_FORMAT_UNDEFINED,
     NV_ENC_CONFIG, NV_ENC_CONFIG_VER,
@@ -115,6 +116,7 @@ cdef int CONTEXT_LIMIT = envint("XPRA_NVENC_CONTEXT_LIMIT", 32)
 cdef int THREADED_INIT = envbool("XPRA_NVENC_THREADED_INIT", True)
 cdef int SLOW_DOWN_INIT = envint("XPRA_NVENC_SLOW_DOWN_INIT", 0)
 cdef int INTRA_REFRESH = envbool("XPRA_NVENC_INTRA_REFRESH", True)
+cdef double RECONFIGURE_MIN_INTERVAL_S = envint("XPRA_NVENC_RECONFIGURE_MIN_INTERVAL_MS", 250) / 1000.0
 
 device_lock = Lock()
 
@@ -416,6 +418,8 @@ cdef class Encoder:
     cdef NV_ENC_INITIALIZE_PARAMS _cached_init_params
     cdef NV_ENC_CONFIG *_cached_encode_config
     cdef int _cached_init_params_valid
+    cdef double _last_reconfigure_time
+    cdef int _preset_unrecoverable
 
     cdef GUID init_codec(self) except *:
         log("init_codec()")
@@ -1165,7 +1169,7 @@ cdef class Encoder:
         return "nvenc(%s/%s/%s - %s - %4ix%-4i)" % (self.src_format, self.pixel_format, self.codec_name, self.preset_name, self.width, self.height)
 
     def is_closed(self) -> bool:
-        return bool(self.closed)
+        return bool(self.closed) or bool(self._preset_unrecoverable)
 
     def __dealloc__(self):
         # When threaded_init is on (the default), clean() spawns
@@ -1381,36 +1385,56 @@ cdef class Encoder:
         return self.pixel_format or ""
 
     def set_encoding_speed(self, int speed) -> None:
-        if self.speed!=speed:
-            self.speed = speed
-            self.update_bitrate()
+        if self.speed == speed:
+            return
+        cdef GUID new_preset
+        cdef int new_preset_changed = 0
+        self.speed = speed  # commit before get_preset reads it
+        if self._cached_init_params_valid:
+            new_preset = self.get_preset(self.codec)
+            new_preset_changed = (memcmp(&new_preset, &self._cached_init_params.presetGUID, sizeof(GUID)) != 0)
+        if new_preset_changed:
+            log("set_encoding_speed(%i): preset boundary crossed; marking encoder "
+                "unrecoverable so next verify_csc_and_encoder triggers teardown", speed)
+            self._preset_unrecoverable = 1
+            return
+        self.update_bitrate()
+        self._apply_reconfigure(reset_encoder=1, force_idr=1)
 
     def set_encoding_quality(self, int quality) -> None:
-        #cdef NV_ENC_RECONFIGURE_PARAMS reconfigure_params
         assert self.context, "context is not initialized"
-        if self.quality==quality:
+        if self.quality == quality:
             return
-        log("set_encoding_quality(%s) current quality=%s", quality, self.quality)
-        if quality<LOSSLESS_THRESHOLD:
-            #edge resistance:
-            raw_delta = quality-self.quality
-            max_delta = max(-1, min(1, raw_delta))*10
-            if abs(raw_delta)<abs(max_delta):
+        cdef int old_quality = self.quality
+        self.quality = quality
+        cdef int target_quality
+        if quality < LOSSLESS_THRESHOLD:
+            raw_delta = quality - old_quality
+            max_delta = max(-1, min(1, raw_delta)) * 10
+            if abs(raw_delta) < abs(max_delta):
                 delta = raw_delta
             else:
                 delta = max_delta
-            target_quality = quality-delta
+            target_quality = quality - delta
         else:
             target_quality = 100
-        self.quality = quality
         log("set_encoding_quality(%s) target quality=%s", quality, target_quality)
-        #code removed:
-        #new_pixel_format = self.get_target_pixel_format(target_quality)
-        #etc...
-        #we can't switch pixel format,
-        #because we would need to free the buffers and re-allocate new ones
-        #best to just tear down the encoder context and create a new one
-        return
+        # If target pixel format or lossless mode would change, don't reconfigure:
+        # pixel format changes require buffer teardown and realloc, which
+        # nvEncReconfigureEncoder cannot do. The candidate-space gate in
+        # update_encoding_options will detect the band change and trigger
+        # full teardown on the next tick.
+        new_pixel_format = self.get_target_pixel_format(target_quality)
+        new_lossless = self.get_target_lossless(new_pixel_format, target_quality)
+        if new_pixel_format != self.pixel_format or new_lossless != self.lossless:
+            log("set_encoding_quality(%s): pixel format/lossless would change "
+                "(%s->%s, %s->%s) — deferring to teardown path",
+                quality, self.pixel_format, new_pixel_format,
+                self.lossless, new_lossless)
+            return
+        # Bitrate-only change: push to live encoder.
+        self.update_bitrate()
+        self._apply_reconfigure(reset_encoder=1, force_idr=1)
 
     cdef void update_bitrate(self):
         #use an exponential scale so for a 1Kx1K image (after scaling), roughly:
@@ -1428,6 +1452,40 @@ cdef class Encoder:
         lim = 100*1000000
         self.target_bitrate = min(lim, max(1000000, int(((0.5+self.speed/200.0)**8)*lim*MPixels*mult)))
         self.max_bitrate = 2*self.target_bitrate
+
+    cdef void _apply_reconfigure(self, int reset_encoder, int force_idr):
+        """Push a bitrate-only update to the live encoder using
+        nvEncReconfigureEncoder. The cached init-params snapshot is used so
+        presetGUID is preserved — nvenc rejects preset changes on a live
+        encoder. Bitrate fields are populated by tune_qp() from
+        self.target_bitrate / self.max_bitrate.
+
+        Rate-limited to RECONFIGURE_MIN_INTERVAL_S so auto-tuner bursts
+        do not issue back-to-back reconfigures."""
+        cdef double now = monotonic()
+        if now - self._last_reconfigure_time < RECONFIGURE_MIN_INTERVAL_S:
+            return
+        self._last_reconfigure_time = now
+        cdef NV_ENC_RECONFIGURE_PARAMS reconfigure_params
+        cdef NVENCSTATUS r
+        memset(&reconfigure_params, 0, sizeof(NV_ENC_RECONFIGURE_PARAMS))
+        reconfigure_params.version = NV_ENC_RECONFIGURE_PARAMS_VER
+        # _copy_cached_init_params allocates a fresh encodeConfig on dest;
+        # the finally block below free()s it.
+        self._copy_cached_init_params(&reconfigure_params.reInitEncodeParams)
+        try:
+            if reconfigure_params.reInitEncodeParams.encodeConfig != NULL:
+                self.tune_qp(&reconfigure_params.reInitEncodeParams.encodeConfig.rcParams)
+            reconfigure_params.resetEncoder = reset_encoder
+            reconfigure_params.forceIDR = force_idr
+            with nogil:
+                r = self.functionList.nvEncReconfigureEncoder(self.context, &reconfigure_params)
+            raiseNVENC(r, "reconfiguring encoder")
+            log("nvEncReconfigureEncoder OK: target_bitrate=%i max_bitrate=%i",
+                self.target_bitrate, self.max_bitrate)
+        finally:
+            if reconfigure_params.reInitEncodeParams.encodeConfig != NULL:
+                free(reconfigure_params.reInitEncodeParams.encodeConfig)
 
     cdef void flushEncoder(self):
         cdef NV_ENC_PIC_PARAMS pic

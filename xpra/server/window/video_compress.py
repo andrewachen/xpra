@@ -219,6 +219,7 @@ class WindowVideoSource(WindowSource):
         self.last_pipeline_time: float = 0.0
         self.reinit_count: int = 0
         self._last_candidate_space: tuple | None = None
+        self._last_video_pixel_format: str = ""
         self._consecutive_encode_failures: int = 0
 
         self.video_subregion = VideoSubregion(self.refresh_subregion, self.auto_refresh_delay, VIDEO_SUBREGION)
@@ -1891,21 +1892,12 @@ class WindowVideoSource(WindowSource):
         # equivalent is wired in Task 15.
         yuv444_threshold = envint("XPRA_NVENC_YUV444_THRESHOLD", 85)
         yuv444_deadband = envint("XPRA_NVENC_YUV444_DEADBAND", 5)
-        # Prefer get_pixel_format() (post-CSC target on nvenc); fall back to
-        # get_src_format() for older encoders where src == target. Using
-        # get_src_format() alone would make currently_yuv444 always False on
-        # nvenc (its src_format is the upstream BGRX/XRGB/r210, never YUV444P)
-        # and silently disable the R1 deadband for nvenc.
-        current_pf = None
-        ve = self._video_encoder
-        if ve is not None:
-            try:
-                current_pf = ve.get_pixel_format()
-            except AttributeError:
-                try:
-                    current_pf = ve.get_src_format()
-                except AttributeError:
-                    current_pf = None
+        # Read the target pixel format from the cache rather than probing the
+        # live encoder: by the time we get here on rebuild paths the encoder
+        # may be None (video_context_clean ran) or cleaned (ve.clean() reset
+        # its pixel_format). The cache is populated whenever a new encoder is
+        # installed in setup_pipeline_option and survives teardown.
+        current_pf = self._last_video_pixel_format or None
         currently_yuv444 = (current_pf == "YUV444P")
         if currently_yuv444:
             yuv444_active = self._current_quality >= (yuv444_threshold - yuv444_deadband)
@@ -2261,19 +2253,13 @@ class WindowVideoSource(WindowSource):
         options["dst-formats"] = dst_formats
         options["datagram"] = self.datagram
 
-        # Thread the previous encoder's target pixel_format into the new
-        # encoder so Y2 hysteresis can engage on the rebuild path. For nvenc,
-        # get_pixel_format() returns the post-CSC target (YUV444P/NV12/...);
-        # get_src_format() is the pre-CSC upstream input (BGRX/r210/...) and
-        # wouldn't tell us whether the prior encoder was in YUV444 mode.
-        old_ve = self._video_encoder
-        if old_ve is not None:
-            try:
-                prev_pf = old_ve.get_pixel_format()
-            except AttributeError:
-                prev_pf = old_ve.get_src_format()
-            if prev_pf:
-                options["previous-pixel-format"] = prev_pf
+        # Thread the previous encoder's target pixel format into the new one
+        # so Y2 hysteresis can engage on the rebuild path. We can't read it
+        # from self._video_encoder live: by the time we get here it's typically
+        # None (video_context_clean ran) or cleaned (ve.clean() reset its
+        # pixel_format). Use the cached value from the last installed encoder.
+        if self._last_video_pixel_format:
+            options["previous-pixel-format"] = self._last_video_pixel_format
 
         ve.init_context(encoding, enc_width, enc_height, enc_in_format, typedict(options))
         # record new actual limits:
@@ -2287,6 +2273,13 @@ class WindowVideoSource(WindowSource):
         enc_end = monotonic()
         self.start_video_frame = 0
         self._video_encoder = ve
+        try:
+            self._last_video_pixel_format = ve.get_pixel_format()
+        except AttributeError:
+            try:
+                self._last_video_pixel_format = ve.get_src_format()
+            except AttributeError:
+                self._last_video_pixel_format = ""
         videolog("setup_pipeline: csc=%s, video encoder=%s, info: %s, setup took %.2fms",
                  csce, ve, ve.get_info(), (enc_end - enc_start) * 1000)
         scalinglog("setup_pipeline: scaling=%s, encoder_scaling=%s", scaling, encoder_scaling)

@@ -911,6 +911,14 @@ cdef class Encoder:
         rc.enableInitialRCQP = 1
         rc.initialRCQP.qpInterP = qp
         rc.initialRCQP.qpIntra = qp
+        # R3 Prerequisite 1: populate bitrate targets so VBR rate control has
+        # something to aim for. Without this, target_bitrate/max_bitrate are
+        # computed by update_bitrate() but never reach nvenc. QP clamping above
+        # provides quality bounds; these provide bitrate bounds.
+        if self.target_bitrate > 0:
+            rc.averageBitRate = self.target_bitrate
+        if self.max_bitrate > 0:
+            rc.maxBitRate = self.max_bitrate
         #cbr:
         #rc.targetQuality = qp
         #rc.targetQualityLSB = 0

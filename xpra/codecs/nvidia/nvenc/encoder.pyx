@@ -520,7 +520,8 @@ cdef class Encoder:
 
         options = options or typedict()
         #the pixel format we feed into the encoder
-        self.pixel_format = self.get_target_pixel_format(self.quality)
+        prev_pf = options.strget("previous-pixel-format", "")
+        self.pixel_format = self.get_target_pixel_format(self.quality, prev_pf)
         self.profile_name = self._get_profile(options)
         self.lossless = self.get_target_lossless(self.pixel_format, self.quality)
         log("using %s %s compression at %s%% quality with pixel format %s",
@@ -620,7 +621,7 @@ cdef class Encoder:
     def is_ready(self) -> bool:
         return bool(self.ready)
 
-    def get_target_pixel_format(self, int quality) -> str:
+    def get_target_pixel_format(self, int quality, previous_pixel_format: str = "") -> str:
         global NATIVE_RGB, YUV420_ENABLED, YUV444_ENABLED, LOSSLESS_ENABLED, YUV444_THRESHOLD, YUV444_DEADBAND, YUV444_CODEC_SUPPORT
         v = ""
         hasyuv444 = YUV444_CODEC_SUPPORT.get(self.encoding, YUV444_ENABLED) and "YUV444P" in self.dst_formats
@@ -639,8 +640,12 @@ cdef class Encoder:
                 #(YUV444_THRESHOLD - YUV444_DEADBAND); switch up at the raw
                 #threshold. Prevents flapping around the boundary that would
                 #otherwise force a teardown (pixel-format changes can't be
-                #handled via nvEncReconfigureEncoder).
-                if self.pixel_format == "YUV444P":
+                #handled via nvEncReconfigureEncoder). init_context() clears
+                #self.pixel_format before calling us, so we rely on the
+                #caller threading the prior encoder's pixel format via
+                #previous_pixel_format; self.pixel_format is only useful on
+                #the (rare) in-place call path that doesn't reinit.
+                if (previous_pixel_format or self.pixel_format) == "YUV444P":
                     upcross = YUV444_THRESHOLD - YUV444_DEADBAND
                 else:
                     upcross = YUV444_THRESHOLD
@@ -1317,6 +1322,13 @@ cdef class Encoder:
 
     def get_src_format(self) -> str:
         return self.src_format
+
+    def get_pixel_format(self) -> str:
+        """Target pixel format (YUV444P / NV12 / BGRX / r210), as fed to nvenc.
+        Distinct from get_src_format() which returns the upstream-converter
+        input (e.g. BGRX). Other encoders' src_format == pixel_format; nvenc
+        is the exception because it does internal CSC."""
+        return self.pixel_format or ""
 
     def set_encoding_speed(self, int speed) -> None:
         if self.speed!=speed:

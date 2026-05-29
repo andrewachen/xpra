@@ -1891,10 +1891,21 @@ class WindowVideoSource(WindowSource):
         # equivalent is wired in Task 15.
         yuv444_threshold = envint("XPRA_NVENC_YUV444_THRESHOLD", 85)
         yuv444_deadband = envint("XPRA_NVENC_YUV444_DEADBAND", 5)
-        try:
-            current_pf = self._video_encoder.get_src_format() if self._video_encoder else None
-        except AttributeError:
-            current_pf = None
+        # Prefer get_pixel_format() (post-CSC target on nvenc); fall back to
+        # get_src_format() for older encoders where src == target. Using
+        # get_src_format() alone would make currently_yuv444 always False on
+        # nvenc (its src_format is the upstream BGRX/XRGB/r210, never YUV444P)
+        # and silently disable the R1 deadband for nvenc.
+        current_pf = None
+        ve = self._video_encoder
+        if ve is not None:
+            try:
+                current_pf = ve.get_pixel_format()
+            except AttributeError:
+                try:
+                    current_pf = ve.get_src_format()
+                except AttributeError:
+                    current_pf = None
         currently_yuv444 = (current_pf == "YUV444P")
         if currently_yuv444:
             yuv444_active = self._current_quality >= (yuv444_threshold - yuv444_deadband)
@@ -2249,6 +2260,20 @@ class WindowVideoSource(WindowSource):
             options["scaled-height"] = enc_height*n//d
         options["dst-formats"] = dst_formats
         options["datagram"] = self.datagram
+
+        # Thread the previous encoder's target pixel_format into the new
+        # encoder so Y2 hysteresis can engage on the rebuild path. For nvenc,
+        # get_pixel_format() returns the post-CSC target (YUV444P/NV12/...);
+        # get_src_format() is the pre-CSC upstream input (BGRX/r210/...) and
+        # wouldn't tell us whether the prior encoder was in YUV444 mode.
+        old_ve = self._video_encoder
+        if old_ve is not None:
+            try:
+                prev_pf = old_ve.get_pixel_format()
+            except AttributeError:
+                prev_pf = old_ve.get_src_format()
+            if prev_pf:
+                options["previous-pixel-format"] = prev_pf
 
         ve.init_context(encoding, enc_width, enc_height, enc_in_format, typedict(options))
         # record new actual limits:

@@ -50,6 +50,46 @@ class CandidateSpaceTest(unittest.TestCase):
         self.assertNotEqual(fp_low, fp_high,
                             "crossing YUV444_THRESHOLD must change fingerprint")
 
+    def test_deadband_engages_when_currently_yuv444(self):
+        """R1 Y2 deadband: if the current encoder is already in YUV444P, a
+        small quality dip below the raw threshold must stay in YUV444P
+        (the fingerprint must match the high-quality fingerprint, not the
+        low-quality NV12 one). Uses get_pixel_format() which is the post-CSC
+        target format on nvenc; get_src_format() returns the upstream input
+        ("BGRX") and would silently disable the deadband."""
+        # quality 90 above threshold (85): both should produce YUV444 for nvenc.
+        wvs = self._make_wvs(quality=90)
+        fp_yuv444 = wvs._compute_candidate_pixel_format_fingerprint()
+        # quality 70 well below threshold, no current encoder: NV12 baseline.
+        wvs_nv12 = self._make_wvs(quality=70)
+        fp_nv12 = wvs_nv12.compute_fp = wvs_nv12._compute_candidate_pixel_format_fingerprint()
+        self.assertNotEqual(fp_yuv444, fp_nv12,
+                            "high vs low quality without deadband must differ")
+        # quality 82, but the current encoder is in YUV444P. Deadband
+        # (threshold 85 - deadband 5 = 80) means we stay in YUV444 ⇒
+        # fingerprint matches the high-quality YUV444 case.
+        wvs_dead = self._make_wvs(quality=82)
+        wvs_dead._video_encoder = MagicMock()
+        wvs_dead._video_encoder.get_pixel_format.return_value = "YUV444P"
+        fp_dead = wvs_dead._compute_candidate_pixel_format_fingerprint()
+        self.assertEqual(fp_dead, fp_yuv444,
+                         "deadband must keep YUV444 active when prior encoder was YUV444P")
+
+    def test_deadband_falls_back_to_src_format_for_non_nvenc(self):
+        """Older / non-nvenc encoders may not implement get_pixel_format();
+        the helper must fall back to get_src_format() (which equals the
+        target format for those encoders)."""
+        wvs = self._make_wvs(quality=82)
+        ve = MagicMock(spec=["get_src_format"])  # no get_pixel_format
+        ve.get_src_format.return_value = "YUV444P"
+        wvs._video_encoder = ve
+        # quality 90 ⇒ above raw threshold, deterministic YUV444 fingerprint.
+        wvs_hi = self._make_wvs(quality=90)
+        fp_hi = wvs_hi._compute_candidate_pixel_format_fingerprint()
+        fp_dead = wvs._compute_candidate_pixel_format_fingerprint()
+        self.assertEqual(fp_dead, fp_hi,
+                         "src_format fallback must engage deadband for non-nvenc encoders")
+
     def test_candidate_space_changes_with_content_type(self):
         wvs = self._make_wvs()
         space1 = wvs._compute_candidate_space()

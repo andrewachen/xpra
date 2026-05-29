@@ -410,6 +410,14 @@ cdef class Encoder:
 
     cdef object __weakref__
 
+    # Cached init params for the reconfigure path. We own _cached_encode_config
+    # because the original allocated by init_params() is freed by init_encoder()'s
+    # finally block immediately after nvEncInitializeEncoder returns.
+    cdef NV_ENC_INITIALIZE_PARAMS _cached_init_params
+    cdef NV_ENC_CONFIG *_cached_encode_config
+    cdef int _cached_init_params_valid
+    cdef GUID _cached_preset_guid
+
     cdef GUID init_codec(self) except *:
         log("init_codec()")
         codecs = self.query_codecs()
@@ -794,6 +802,21 @@ cdef class Encoder:
             raiseNVENC(r, "initializing encoder")
             log("NVENC initialized with '%s' codec and '%s' preset" % (self.codec_name, self.preset_name))
 
+            # Shallow-copy the outer struct, then deep-copy encodeConfig into our
+            # own heap buffer. The finally below will free params.encodeConfig, so
+            # we must not retain that pointer.
+            memcpy(&self._cached_init_params, params, sizeof(NV_ENC_INITIALIZE_PARAMS))
+            if params.encodeConfig != NULL:
+                self._cached_encode_config = <NV_ENC_CONFIG*> malloc(sizeof(NV_ENC_CONFIG))
+                assert self._cached_encode_config != NULL, "OOM caching encodeConfig"
+                memcpy(self._cached_encode_config, params.encodeConfig, sizeof(NV_ENC_CONFIG))
+                self._cached_init_params.encodeConfig = self._cached_encode_config
+            else:
+                self._cached_encode_config = NULL
+                self._cached_init_params.encodeConfig = NULL
+            self._cached_preset_guid = params.presetGUID
+            self._cached_init_params_valid = 1
+
             self.dump_caps(self.codec_name, codec)
         finally:
             if params.encodeConfig!=NULL:
@@ -858,6 +881,19 @@ cdef class Encoder:
         config.profileGUID = profile
         self.tune_preset(config)
         params.encodeConfig = config
+
+    cdef void _copy_cached_init_params(self, NV_ENC_INITIALIZE_PARAMS *dest):
+        """Copy the snapshot taken at init time into dest. Allocates a fresh
+        encodeConfig buffer on dest — caller is responsible for free()-ing
+        dest.encodeConfig after use (matches the init_params caller contract)."""
+        assert self._cached_init_params_valid, "init params snapshot missing"
+        memcpy(dest, &self._cached_init_params, sizeof(NV_ENC_INITIALIZE_PARAMS))
+        if self._cached_encode_config != NULL:
+            dest.encodeConfig = <NV_ENC_CONFIG*> malloc(sizeof(NV_ENC_CONFIG))
+            assert dest.encodeConfig != NULL, "OOM copying encodeConfig"
+            memcpy(dest.encodeConfig, self._cached_encode_config, sizeof(NV_ENC_CONFIG))
+        else:
+            dest.encodeConfig = NULL
 
     cdef int get_chroma_format(self):
         cdef int chroma = get_chroma_format(self.pixel_format)
@@ -1248,6 +1284,10 @@ cdef class Encoder:
         self.last_frame_times = []
         self.bytes_in = 0
         self.bytes_out = 0
+        if self._cached_encode_config != NULL:
+            free(self._cached_encode_config)
+            self._cached_encode_config = NULL
+        self._cached_init_params_valid = 0
         log("clean() done")
 
     cdef void cuda_clean(self):

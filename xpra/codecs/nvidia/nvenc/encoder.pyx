@@ -540,6 +540,9 @@ cdef class Encoder:
         self.pixel_format = self.get_target_pixel_format(self.quality, prev_pf)
         self.profile_name = self._get_profile(options)
         self.lossless = self.get_target_lossless(self.pixel_format, self.quality)
+        # Recompute now that pixel_format is set so the NV12 multiplier (0.5)
+        # applies when NV12 was selected above.
+        self.update_bitrate()
         log("using %s %s compression at %s%% quality with pixel format %s",
             ["lossy","lossless"][self.lossless], encoding, self.quality, self.pixel_format)
 
@@ -1212,6 +1215,27 @@ cdef class Encoder:
             else:
                 self.do_clean()
 
+    def synchronous_clean(self) -> None:
+        """Clean up on the calling thread. Equivalent to clean() but does
+        not spawn a daemon thread, even when threaded_init=True. Use when
+        the caller cannot tolerate async cleanup — e.g. handing the
+        encoder slot back to a queue that would otherwise race a new
+        instantiation against this teardown."""
+        f = self.file
+        if f:
+            self.file = None
+            f.close()
+        if self.closed:
+            return
+        self.closed = 1
+        # Wait for any in-flight threaded_init_device before tearing down,
+        # matching the guard in threaded_clean. Without this, do_clean
+        # can interleave with init_nvenc's nvEncRegisterResource while
+        # buffer_clean nulls cudaOutputBuffer.
+        if self.threaded_init and self.init_complete is not None:
+            self.init_complete.wait()
+        self.do_clean()
+
     def threaded_clean(self) -> None:
         # Wait for threaded_init_device to finish before cleaning up.
         # init_device drops cdc.lock between init_cuda_kernel and
@@ -1388,6 +1412,13 @@ cdef class Encoder:
         input (e.g. BGRX). Other encoders' src_format == pixel_format; nvenc
         is the exception because it does internal CSC."""
         return self.pixel_format or ""
+
+    def get_lossless(self) -> bool:
+        """Whether the encoder is currently running in lossless mode.
+        Exposed for verify_csc_and_encoder to detect lossy<->lossless
+        transitions that require teardown (lossless preset can't be changed
+        on a live encoder via nvEncReconfigureEncoder)."""
+        return bool(self.lossless)
 
     def set_encoding_speed(self, int speed) -> None:
         assert self.context, "context is not initialized"

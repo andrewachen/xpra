@@ -44,7 +44,9 @@ class CandidateSpaceTest(unittest.TestCase):
                          "quality changes within the same band must not change fingerprint")
 
     def test_fingerprint_changes_crossing_yuv444_threshold(self):
-        wvs = self._make_wvs(quality=80)
+        # Use NV12 source so the YUV444/NV12 threshold path is exercised.
+        # BGRX with native-RGB enabled stays pinned to BGRX regardless of quality.
+        wvs = self._make_wvs(quality=80, pixel_format="NV12")
         fp_low = wvs._compute_candidate_pixel_format_fingerprint()
         wvs._current_quality = 90
         fp_high = wvs._compute_candidate_pixel_format_fingerprint()
@@ -59,18 +61,20 @@ class CandidateSpaceTest(unittest.TestCase):
         from _last_video_pixel_format, populated by setup_pipeline_option
         whenever a new encoder is installed; the cache survives encoder
         teardown so the deadband still engages on rebuild paths."""
+        # Use NV12 source so the YUV444/NV12 threshold path is exercised.
+        # BGRX with native-RGB enabled stays pinned to BGRX regardless of quality.
         # quality 90 above threshold (85): both should produce YUV444 for nvenc.
-        wvs = self._make_wvs(quality=90)
+        wvs = self._make_wvs(quality=90, pixel_format="NV12")
         fp_yuv444 = wvs._compute_candidate_pixel_format_fingerprint()
         # quality 70 well below threshold, no prior YUV444 encoder: NV12 baseline.
-        wvs_nv12 = self._make_wvs(quality=70)
+        wvs_nv12 = self._make_wvs(quality=70, pixel_format="NV12")
         fp_nv12 = wvs_nv12._compute_candidate_pixel_format_fingerprint()
         self.assertNotEqual(fp_yuv444, fp_nv12,
                             "high vs low quality without deadband must differ")
         # quality 82, but the cache records the prior encoder was in YUV444P.
         # Deadband (threshold 85 - deadband 5 = 80) means we stay in YUV444 ⇒
         # fingerprint matches the high-quality YUV444 case.
-        wvs_dead = self._make_wvs(quality=82)
+        wvs_dead = self._make_wvs(quality=82, pixel_format="NV12")
         wvs_dead._last_video_pixel_format = "YUV444P"
         fp_dead = wvs_dead._compute_candidate_pixel_format_fingerprint()
         self.assertEqual(fp_dead, fp_yuv444,
@@ -81,16 +85,44 @@ class CandidateSpaceTest(unittest.TestCase):
         probe self._video_encoder. This guarantees the deadband engages on
         rebuild paths where the live encoder is already None (cleanup ran)
         or has been .clean()'ed (its internal pixel_format reset to "")."""
+        # Use NV12 source to exercise the YUV444/NV12 threshold path.
         # Cache says YUV444P, but _video_encoder is None (post-cleanup state).
-        wvs = self._make_wvs(quality=82)
+        wvs = self._make_wvs(quality=82, pixel_format="NV12")
         wvs._video_encoder = None
         wvs._last_video_pixel_format = "YUV444P"
         # Pre-compute the YUV444 fingerprint via the above-threshold path.
-        wvs_hi = self._make_wvs(quality=90)
+        wvs_hi = self._make_wvs(quality=90, pixel_format="NV12")
         fp_hi = wvs_hi._compute_candidate_pixel_format_fingerprint()
         fp_dead = wvs._compute_candidate_pixel_format_fingerprint()
         self.assertEqual(fp_dead, fp_hi,
                          "cache must engage deadband even when _video_encoder is None")
+
+    def test_bgrx_native_rgb_fingerprint_stable_across_threshold(self):
+        """BGRX source with native-RGB enabled stays pinned to BGRX regardless
+        of quality. The fingerprint must not flip NV12<->YUV444P at the
+        threshold — nvenc's get_target_pixel_format returns BGRX first when
+        native_rgb=True and src_format=BGRX, before the threshold is checked."""
+        import os
+        # Ensure native-RGB is on (default on Linux; make it explicit here).
+        orig = os.environ.get("XPRA_NVENC_NATIVE_RGB")
+        try:
+            os.environ["XPRA_NVENC_NATIVE_RGB"] = "1"
+            wvs_low = self._make_wvs(quality=80, pixel_format="BGRX")
+            fp_low = wvs_low._compute_candidate_pixel_format_fingerprint()
+            wvs_high = self._make_wvs(quality=90, pixel_format="BGRX")
+            fp_high = wvs_high._compute_candidate_pixel_format_fingerprint()
+            self.assertEqual(fp_low, fp_high,
+                             "BGRX+native-RGB fingerprint must be stable across the YUV444 threshold")
+            # Verify the fingerprint actually contains BGRX for nvenc encodings.
+            for encoding, pf in fp_low:
+                if encoding in ("h264", "h265"):
+                    self.assertEqual(pf, "BGRX",
+                                     f"nvenc encoding {encoding} must target BGRX with native-RGB")
+        finally:
+            if orig is None:
+                os.environ.pop("XPRA_NVENC_NATIVE_RGB", None)
+            else:
+                os.environ["XPRA_NVENC_NATIVE_RGB"] = orig
 
     def test_candidate_space_changes_with_content_type(self):
         wvs = self._make_wvs()
@@ -188,9 +220,11 @@ class UpdateEncodingOptionsGateTest(unittest.TestCase):
             WindowVideoSource.update_encoding_options(wvs, force_reload)
 
     def test_first_call_runs_scoring(self):
+        # First call: space changed from None → something, so space_changed=True.
+        # update_pipeline_scores receives (force_reload or space_changed) = True.
         wvs = self._make_wvs()
         self._call_update(wvs, force_reload=False)
-        wvs.update_pipeline_scores.assert_called_once_with(False)
+        wvs.update_pipeline_scores.assert_called_once_with(True)
 
     def test_unchanged_space_skips_scoring(self):
         wvs = self._make_wvs()
@@ -209,12 +243,15 @@ class UpdateEncodingOptionsGateTest(unittest.TestCase):
         wvs.update_pipeline_scores.assert_not_called()
 
     def test_content_type_change_triggers_scoring(self):
+        # Candidate space changed (content_type changed), so space_changed=True.
+        # update_pipeline_scores receives (force_reload or space_changed) = True,
+        # bypassing the internal throttle for a genuine candidate-space transition.
         wvs = self._make_wvs()
         self._call_update(wvs, force_reload=False)
         wvs.update_pipeline_scores.reset_mock()
         wvs.content_type = "video"
         self._call_update(wvs, force_reload=False)
-        wvs.update_pipeline_scores.assert_called_once_with(False)
+        wvs.update_pipeline_scores.assert_called_once_with(True)
 
     def test_force_reload_always_runs_scoring(self):
         wvs = self._make_wvs()
@@ -280,7 +317,12 @@ class SafetyValveTest(unittest.TestCase):
         self.assertIsNone(wvs._csc_encoder,
                           "safety valve must null _csc_encoder")
         csce.clean.assert_called_once()
-        ve.clean.assert_called_once()
+        # Safety valve must use synchronous_clean when available: ve.clean() is
+        # async on nvenc's threaded_init=True default and would return before
+        # the NVENC session is destroyed, letting the next damage item open a
+        # replacement while teardown is still in flight.
+        ve.synchronous_clean.assert_called_once()
+        ve.clean.assert_not_called()
         # reinit_count must be bumped (semantic equivalent to video_context_clean)
         self.assertEqual(wvs.reinit_count, 1,
                          "reinit_count must bump on safety-valve cleanup")

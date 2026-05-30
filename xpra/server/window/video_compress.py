@@ -12,7 +12,7 @@ from time import monotonic
 from typing import Any
 from collections.abc import Callable, Iterable, Sequence
 
-from xpra.os_util import gi_import
+from xpra.os_util import gi_import, WIN32
 from xpra.net.compression import Compressed, LargeStructure
 from xpra.codecs.constants import (
     TransientCodecException, get_subsampling,
@@ -1359,7 +1359,7 @@ class WindowVideoSource(WindowSource):
             # that `id()` falls into when update_pipeline_scores cancels
             # mid-run and assigns self.last_pipeline_scores = ().
             prev_scores = self.last_pipeline_scores
-            self.update_pipeline_scores(force_reload)
+            self.update_pipeline_scores(force_reload or space_changed)
             scores_refreshed = (self.last_pipeline_scores is not prev_scores) or force_reload
             if scores_refreshed:
                 # Only advance the cache when fresh scores actually landed,
@@ -1500,6 +1500,26 @@ class WindowVideoSource(WindowSource):
             if ve.get_type() != encoder_spec.codec_type:
                 scorelog(f" found a better video encoder type than {ve.get_type()}: {encoder_spec.codec_type}")
                 return False
+            # get_src_format() reflects the upstream input format only; for
+            # nvenc, the codec-internal pixel format (e.g. NV12 vs YUV444P)
+            # flips at the YUV444 threshold independently. Check that
+            # separately so crossings trigger teardown before the fingerprint
+            # would catch them on the next scoring cycle.
+            get_pf = getattr(ve, "get_pixel_format", None)
+            if get_pf is not None:
+                actual_pf = get_pf()
+                expected_pf = self._compute_expected_target_pixel_format(ve.get_encoding())
+                if actual_pf and expected_pf and actual_pf != expected_pf:
+                    scorelog(" encoder pixel format would change from %s to %s",
+                             actual_pf, expected_pf)
+                    return False
+            get_lossless = getattr(ve, "get_lossless", None)
+            if get_lossless is not None:
+                lossless_target = self._current_quality >= envint("XPRA_NVENC_LOSSLESS_THRESHOLD", 100)
+                if bool(get_lossless()) != lossless_target:
+                    scorelog(" encoder lossless mode would change from %s to %s",
+                             bool(get_lossless()), lossless_target)
+                    return False
         if self.actual_scaling != encoder_scaling:
             scorelog(" change of scaling from %s to %s", self.actual_scaling, encoder_scaling)
             return False
@@ -1903,20 +1923,61 @@ class WindowVideoSource(WindowSource):
             yuv444_active = self._current_quality >= (yuv444_threshold - yuv444_deadband)
         else:
             yuv444_active = self._current_quality >= yuv444_threshold
+        # Native-RGB and r210 paths pin the encoder pixel format independent
+        # of quality — see encoder.pyx:get_target_pixel_format priority order.
+        # Skipping these here would flip the fingerprint NV12↔YUV444P at the
+        # threshold even though nvenc would stay in BGRX or r210.
+        native_rgb = envbool("XPRA_NVENC_NATIVE_RGB", int(not WIN32))
+        src_pf = self.pixel_format
         entries = []
         for encoding in self.common_video_encodings:
             # YUV444_CODEC_SUPPORT keys are the actual nvenc encoding names
             # (h264, h265 — NOT 'hevc'). av1 has False by default. Anything
             # outside the dict is non-nvenc and uses its own input pixel format.
             if YUV444_CODEC_SUPPORT.get(encoding, False):
-                target_pf = "YUV444P" if yuv444_active else "NV12"
+                if native_rgb and src_pf == "BGRX":
+                    target_pf = "BGRX"
+                elif src_pf == "r210":
+                    target_pf = "r210"
+                else:
+                    target_pf = "YUV444P" if yuv444_active else "NV12"
             elif encoding in YUV444_CODEC_SUPPORT:
                 # Known to nvenc but YUV444-incapable → always NV12 for these
                 target_pf = "NV12"
             else:
-                target_pf = self.pixel_format
+                target_pf = src_pf
             entries.append((encoding, target_pf))
         return frozenset(entries)
+
+    def _compute_expected_target_pixel_format(self, encoding: str) -> str:
+        """Compute the pixel format nvenc would feed to the codec for `encoding`
+        at the current quality, mirroring encoder.pyx get_target_pixel_format.
+        Used by verify_csc_and_encoder to catch NV12<->YUV444P transitions that
+        score-vs-score comparison misses (the fingerprint catches them only on
+        the next scoring cycle, after teardown has already been skipped)."""
+        try:
+            from xpra.codecs.nvidia.nvenc.encoder import YUV444_CODEC_SUPPORT
+        except ImportError:
+            return ""
+        if not YUV444_CODEC_SUPPORT.get(encoding, False):
+            # Not a YUV444-capable nvenc encoding (e.g. av1, or non-nvenc).
+            if encoding in YUV444_CODEC_SUPPORT:
+                return "NV12"
+            return ""
+        yuv444_threshold = envint("XPRA_NVENC_YUV444_THRESHOLD", 85)
+        yuv444_deadband = envint("XPRA_NVENC_YUV444_DEADBAND", 5)
+        native_rgb = envbool("XPRA_NVENC_NATIVE_RGB", int(not WIN32))
+        src_pf = self.pixel_format
+        if native_rgb and src_pf == "BGRX":
+            return "BGRX"
+        if src_pf == "r210":
+            return "r210"
+        currently_yuv444 = (self._last_video_pixel_format == "YUV444P")
+        if currently_yuv444:
+            yuv444_active = self._current_quality >= (yuv444_threshold - yuv444_deadband)
+        else:
+            yuv444_active = self._current_quality >= yuv444_threshold
+        return "YUV444P" if yuv444_active else "NV12"
 
     def _compute_desired_scaling(self) -> tuple[int, int]:
         """Fresh output of calculate_scaling for current state.
@@ -1936,13 +1997,19 @@ class WindowVideoSource(WindowSource):
     def _compute_candidate_space(self) -> tuple:
         """Tuple R1 compares against the cached last_candidate_space to decide
         whether scoring needs to re-run."""
+        # Subregion geometry as a primitive tuple: rectangle.__richcmp__
+        # raises ValueError on rectangle↔None comparisons, which would
+        # otherwise crash tuple equality whenever the subregion appears
+        # or disappears (e.g., video starts or stops in a browser tab).
+        vsr = self.video_subregion.rectangle if self.video_subregion else None
+        vs_geometry = (vsr.x, vsr.y, vsr.width, vsr.height) if vsr else None
         return (
             self.encoding,
             self.content_type,
             tuple(self.common_video_encodings),
             self.pixel_format,
             self.window_dimensions,
-            self.video_subregion.rectangle if self.video_subregion else None,
+            vs_geometry,
             tuple(sorted(self.full_csc_modes.items())) if self.full_csc_modes else (),
             self._compute_candidate_pixel_format_fingerprint(),
             self._compute_desired_scaling(),
@@ -2005,7 +2072,16 @@ class WindowVideoSource(WindowSource):
                                       exc_info=True)
                 if ve:
                     try:
-                        ve.clean()
+                        # Prefer synchronous cleanup: ve.clean() is async on
+                        # nvenc's threaded_init=True default, returning before
+                        # the NVENC session is destroyed. The next damage item
+                        # would otherwise pick up the freed _video_encoder slot
+                        # and overlap with the in-flight threaded_clean.
+                        sync_clean = getattr(ve, "synchronous_clean", None)
+                        if sync_clean is not None:
+                            sync_clean()
+                        else:
+                            ve.clean()
                     except Exception:
                         videolog.warn("Warning: video_encoder cleanup during safety valve failed",
                                       exc_info=True)

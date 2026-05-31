@@ -124,6 +124,51 @@ class CandidateSpaceTest(unittest.TestCase):
             else:
                 os.environ["XPRA_NVENC_NATIVE_RGB"] = orig
 
+    def test_expected_pf_r210_pins_for_av1(self):
+        """r210 input pins nvenc to r210 for any codec, including
+        YUV444-incapable ones like av1. get_target_pixel_format checks
+        src_format=='r210' before the YUV444-capability gate, so the verify
+        helper must not expect NV12 for av1/r210 (which would tear down a
+        valid AV1/r210 pipeline)."""
+        wvs = self._make_wvs(quality=50, pixel_format="r210")
+        self.assertEqual(wvs._compute_expected_target_pixel_format("av1"), "r210")
+
+    def test_expected_pf_r210_pins_for_h264(self):
+        wvs = self._make_wvs(quality=50, pixel_format="r210")
+        self.assertEqual(wvs._compute_expected_target_pixel_format("h264"), "r210")
+
+    def test_expected_pf_av1_bgrx_is_nv12(self):
+        """av1 is not YUV444-capable, so native-RGB does not engage (nativergb
+        requires YUV444 support). BGRX input therefore goes through CSC to NV12.
+        Regression guard for the r210 reorder — it must not leak BGRX to av1."""
+        import os
+        orig = os.environ.get("XPRA_NVENC_NATIVE_RGB")
+        try:
+            os.environ["XPRA_NVENC_NATIVE_RGB"] = "1"
+            wvs = self._make_wvs(quality=50, pixel_format="BGRX")
+            self.assertEqual(wvs._compute_expected_target_pixel_format("av1"), "NV12")
+        finally:
+            if orig is None:
+                os.environ.pop("XPRA_NVENC_NATIVE_RGB", None)
+            else:
+                os.environ["XPRA_NVENC_NATIVE_RGB"] = orig
+
+    def test_expected_pf_non_nvenc_is_empty(self):
+        """Non-nvenc encodings use their own input format; the verify helper
+        returns "" so verify_csc_and_encoder skips the pixel-format check
+        rather than comparing against an unrelated CSC output format."""
+        wvs = self._make_wvs(quality=50, pixel_format="BGRX")
+        self.assertEqual(wvs._compute_expected_target_pixel_format("vp9"), "")
+
+    def test_fingerprint_r210_pins_for_av1(self):
+        """The candidate-space fingerprint must mirror the verify helper: r210
+        input pins to r210 even for YUV444-incapable nvenc codecs like av1."""
+        wvs = self._make_wvs(quality=50, pixel_format="r210",
+                             common_video_encodings=("h264", "av1"))
+        fp = dict(wvs._compute_candidate_pixel_format_fingerprint())
+        self.assertEqual(fp["av1"], "r210")
+        self.assertEqual(fp["h264"], "r210")
+
     def test_candidate_space_changes_with_content_type(self):
         wvs = self._make_wvs()
         space1 = wvs._compute_candidate_space()
@@ -351,6 +396,75 @@ class SafetyValveTest(unittest.TestCase):
         self.assertIsNone(wvs._video_encoder)
         self.assertIsNone(wvs._csc_encoder)
         self.assertIsNone(wvs._last_candidate_space)
+
+
+class VerifyEncoderLosslessTest(unittest.TestCase):
+    """verify_csc_and_encoder must derive the lossless target from the pixel
+    format the encoder would actually use, not from the quality threshold
+    alone. Otherwise a BGRX/NV12 encoder at quality=100 is torn down expecting
+    a lossless replacement that get_target_lossless never produces."""
+
+    def _make_wvs_with_ve(self, quality, src_pf, encoding, actual_pf, lossless,
+                          last_pf=""):
+        from xpra.server.window.video_compress import WindowVideoSource
+        wvs = WindowVideoSource.__new__(WindowVideoSource)
+        wvs._current_quality = quality
+        wvs.pixel_format = src_pf
+        wvs._last_video_pixel_format = last_pf
+        wvs.actual_scaling = (1, 1)
+        wvs._csc_encoder = None
+        ve = MagicMock()
+        ve.is_closed.return_value = False
+        ve.get_src_format.return_value = "BGRX"        # == enc_in_format below
+        ve.get_width.return_value = 1920
+        ve.get_height.return_value = 1080
+        ve.get_type.return_value = "nvenc"
+        ve.get_encoding.return_value = encoding
+        ve.get_pixel_format.return_value = actual_pf
+        ve.get_lossless.return_value = lossless
+        # Mirror encoder.pyx get_target_lossless: lossless only for YUV444P/r210.
+        ve.get_target_lossless.side_effect = \
+            lambda pf, q: pf in ("YUV444P", "r210") and q >= 100
+        wvs._video_encoder = ve
+        encoder_spec = MagicMock(codec_type="nvenc")
+        # 11-tuple matching verify_csc_and_encoder's unpack of scores[0].
+        score = (0, 0, 0, 1920, 1080, None, "BGRX", (1, 1), 1920, 1080, encoder_spec)
+        wvs.last_pipeline_scores = (score,)
+        return wvs, ve
+
+    def test_bgrx_q100_no_teardown(self):
+        """At q=100 on the default native-RGB BGRX path, the encoder cannot go
+        lossless (get_target_lossless False for BGRX). verify must not tear it
+        down expecting a lossless replacement that never materialises."""
+        import os
+        orig = os.environ.get("XPRA_NVENC_NATIVE_RGB")
+        try:
+            os.environ["XPRA_NVENC_NATIVE_RGB"] = "1"
+            wvs, ve = self._make_wvs_with_ve(100, "BGRX", "h264", "BGRX", False)
+            self.assertTrue(wvs.verify_csc_and_encoder(),
+                            "BGRX encoder at q=100 must not be torn down — it cannot go lossless")
+        finally:
+            if orig is None:
+                os.environ.pop("XPRA_NVENC_NATIVE_RGB", None)
+            else:
+                os.environ["XPRA_NVENC_NATIVE_RGB"] = orig
+
+    def test_yuv444_q100_tears_down_when_lossy(self):
+        """A YUV444P encoder still running lossy at q=100 must be torn down so a
+        lossless replacement is built — the lossless check must still fire when
+        the target format genuinely supports lossless."""
+        wvs, ve = self._make_wvs_with_ve(100, "NV12", "h264", "YUV444P", False,
+                                         last_pf="YUV444P")
+        self.assertFalse(wvs.verify_csc_and_encoder(),
+                         "lossy YUV444P encoder at q=100 must tear down for a lossless rebuild")
+
+    def test_yuv444_q100_already_lossless_no_teardown(self):
+        """A YUV444P encoder already in lossless mode at q=100 must be left
+        alone — no spurious teardown."""
+        wvs, ve = self._make_wvs_with_ve(100, "NV12", "h264", "YUV444P", True,
+                                         last_pf="YUV444P")
+        self.assertTrue(wvs.verify_csc_and_encoder(),
+                        "already-lossless YUV444P encoder at q=100 must not be torn down")
 
 
 if __name__ == "__main__":

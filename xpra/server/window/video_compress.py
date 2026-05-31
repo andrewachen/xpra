@@ -1505,17 +1505,25 @@ class WindowVideoSource(WindowSource):
             # flips at the YUV444 threshold independently. Check that
             # separately so crossings trigger teardown before the fingerprint
             # would catch them on the next scoring cycle.
+            expected_pf = self._compute_expected_target_pixel_format(ve.get_encoding())
             get_pf = getattr(ve, "get_pixel_format", None)
             if get_pf is not None:
                 actual_pf = get_pf()
-                expected_pf = self._compute_expected_target_pixel_format(ve.get_encoding())
                 if actual_pf and expected_pf and actual_pf != expected_pf:
                     scorelog(" encoder pixel format would change from %s to %s",
                              actual_pf, expected_pf)
                     return False
+            # Lossless target must be derived from the pixel format a fresh
+            # encoder would pick, not the quality threshold alone: lossless is
+            # only available for YUV444P/r210 (and lossless-capable codecs).
+            # On the default native-RGB BGRX path get_target_lossless() stays
+            # False even at quality 100, so a threshold-only check would tear
+            # down a valid BGRX encoder expecting a lossless rebuild that never
+            # materialises. Ask the live encoder what it would choose.
             get_lossless = getattr(ve, "get_lossless", None)
-            if get_lossless is not None:
-                lossless_target = self._current_quality >= envint("XPRA_NVENC_LOSSLESS_THRESHOLD", 100)
+            get_target_lossless = getattr(ve, "get_target_lossless", None)
+            if get_lossless is not None and get_target_lossless is not None and expected_pf:
+                lossless_target = bool(get_target_lossless(expected_pf, self._current_quality))
                 if bool(get_lossless()) != lossless_target:
                     scorelog(" encoder lossless mode would change from %s to %s",
                              bool(get_lossless()), lossless_target)
@@ -1934,18 +1942,20 @@ class WindowVideoSource(WindowSource):
             # YUV444_CODEC_SUPPORT keys are the actual nvenc encoding names
             # (h264, h265 — NOT 'hevc'). av1 has False by default. Anything
             # outside the dict is non-nvenc and uses its own input pixel format.
-            if YUV444_CODEC_SUPPORT.get(encoding, False):
+            if encoding not in YUV444_CODEC_SUPPORT:
+                target_pf = src_pf
+            elif src_pf == "r210":
+                # r210 input pins to r210 for any nvenc codec, ahead of the
+                # YUV444-capability gate (mirrors get_target_pixel_format).
+                target_pf = "r210"
+            elif YUV444_CODEC_SUPPORT.get(encoding, False):
                 if native_rgb and src_pf == "BGRX":
                     target_pf = "BGRX"
-                elif src_pf == "r210":
-                    target_pf = "r210"
                 else:
                     target_pf = "YUV444P" if yuv444_active else "NV12"
-            elif encoding in YUV444_CODEC_SUPPORT:
+            else:
                 # Known to nvenc but YUV444-incapable → always NV12 for these
                 target_pf = "NV12"
-            else:
-                target_pf = src_pf
             entries.append((encoding, target_pf))
         return frozenset(entries)
 
@@ -1959,19 +1969,25 @@ class WindowVideoSource(WindowSource):
             from xpra.codecs.nvidia.nvenc.encoder import YUV444_CODEC_SUPPORT
         except ImportError:
             return ""
-        if not YUV444_CODEC_SUPPORT.get(encoding, False):
-            # Not a YUV444-capable nvenc encoding (e.g. av1, or non-nvenc).
-            if encoding in YUV444_CODEC_SUPPORT:
-                return "NV12"
+        if encoding not in YUV444_CODEC_SUPPORT:
+            # Non-nvenc encoding: it feeds the codec its own input format, so
+            # there is no nvenc pixel-format transition to verify here.
             return ""
+        src_pf = self.pixel_format
+        # r210 input pins to r210 for ANY nvenc codec — get_target_pixel_format
+        # checks src_format=='r210' before the YUV444-capability gate, so this
+        # must come before the av1/NV12 branch (otherwise AV1/r210 is wrongly
+        # expected to be NV12 and a valid pipeline is torn down).
+        if src_pf == "r210":
+            return "r210"
+        if not YUV444_CODEC_SUPPORT.get(encoding, False):
+            # Known to nvenc but YUV444-incapable (e.g. av1) → CSC to NV12.
+            return "NV12"
         yuv444_threshold = envint("XPRA_NVENC_YUV444_THRESHOLD", 85)
         yuv444_deadband = envint("XPRA_NVENC_YUV444_DEADBAND", 5)
         native_rgb = envbool("XPRA_NVENC_NATIVE_RGB", int(not WIN32))
-        src_pf = self.pixel_format
         if native_rgb and src_pf == "BGRX":
             return "BGRX"
-        if src_pf == "r210":
-            return "r210"
         currently_yuv444 = (self._last_video_pixel_format == "YUV444P")
         if currently_yuv444:
             yuv444_active = self._current_quality >= (yuv444_threshold - yuv444_deadband)

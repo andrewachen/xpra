@@ -71,8 +71,15 @@ DIST=$(lsb_release -cs)
 # Derive the base version from the source tree (xpra/__init__.py __version__)
 # so the package version tracks the branch's actual release base (6.5, 6.5.x,
 # ...) instead of a hardcoded value.
-BASE_VERSION=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$REPO_DIR/xpra/__init__.py")
-# Sorts above xpra-org's "<base>-r0-1" naming so apt prefers our build.
+BASE_VERSION=$(sed -n 's/^__version__ = "\([^"]*\)"/\1/p' "$REPO_DIR/xpra/__init__.py")
+if [ -z "$BASE_VERSION" ]; then
+    echo "error: could not extract __version__ from $REPO_DIR/xpra/__init__.py" >&2
+    exit 1
+fi
+# The "-achen-<sha>~<dist>" suffix keeps our build distinguishable and ranks it
+# above the older installed fallback base (e.g. 6.4.3). It is NOT meant to
+# outrank a same-base upstream "<base>-r0-1" -- it sorts below that. The
+# daily-driver flow installs the .deb directly, so same-base ordering is moot.
 VERSION="${BASE_VERSION}-achen-${GIT_SHA}~${DIST}"
 
 mkdir -p "$CACHE_DIR" "$OUT_DIR"
@@ -156,7 +163,9 @@ EOF
         # string. Writing the entry directly (vs dch) avoids needing tty/env.
         TS=$(date -R)
         NEW_ENTRY="xpra (${VERSION}) UNRELEASED; urgency=low\n\n  * Build from ${GIT_BRANCH} ${GIT_SHA}\n\n -- ${DEBFULLNAME} <${DEBEMAIL}>  ${TS}\n\n"
-        printf "$NEW_ENTRY" > /tmp/changelog.new
+        # %b expands the \n escapes in NEW_ENTRY without treating the branch
+        # name as a printf format (a '%' in a branch name would break %-format).
+        printf '%b' "$NEW_ENTRY" > /tmp/changelog.new
         cat debian/changelog >> /tmp/changelog.new
         mv /tmp/changelog.new debian/changelog
 

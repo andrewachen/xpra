@@ -27,8 +27,8 @@
 # Therefore this script detects the Python.h incompatibility and exits non-zero
 # with an "S4D-UNAVAILABLE" diagnostic rather than reporting a misleading pass.
 # It does NOT fake a passing compile. If a future dockcross image ships
-# mingw-compatible CPython headers (or you point PYTHON_INCLUDE at a set of
-# them), the compile will proceed and the script will report the real result.
+# mingw-compatible CPython headers in /usr/include, the compile will proceed
+# and the script will report the real result.
 
 set -euo pipefail
 
@@ -54,11 +54,6 @@ esac
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_DIR"
-
-# Optional override: a directory containing mingw-compatible CPython headers.
-# When unset the script uses the dockcross image's own python3 headers, which
-# triggers the S4D-UNAVAILABLE path described above.
-PYTHON_INCLUDE="${PYTHON_INCLUDE:-}"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -94,19 +89,15 @@ compile_check() {
     set +e
     docker run --rm --user "$UIDGID" \
         -v "$WORK":/work -w /work \
-        -e PYTHON_INCLUDE="$PYTHON_INCLUDE" \
         "$image" bash -c '
             set -e
-            # Prefer an explicitly-supplied mingw-compatible CPython include dir;
-            # otherwise fall back to the image host headers (known-incompatible).
-            if [ -n "${PYTHON_INCLUDE:-}" ]; then
-                PYINC="$PYTHON_INCLUDE"
-            else
-                PYINC="$(dirname "$(find /usr/include -name Python.h 2>/dev/null | head -1)")"
-            fi
+            # Use the image host CPython headers (known-incompatible -> the
+            # S4D-UNAVAILABLE path). A future image shipping mingw-compatible
+            # headers in /usr/include would compile here without changes.
+            PYINC="$(dirname "$(find /usr/include -name Python.h 2>/dev/null | head -1)")"
             echo "    CC=$CC"
             echo "    PYINC=$PYINC"
-            $CC -c -I. -I"$PYINC" -o /dev/null '"${STEM}"'.c
+            "$CC" -c -I. -I"$PYINC" -o /dev/null '"${STEM}"'.c
         ' >"$logf" 2>&1
     local rc=$?
     set -e
@@ -116,7 +107,9 @@ compile_check() {
         return 0
     fi
     # Distinguish the known Python.h header gap from a genuine code error.
-    if grep -qE 'unknown multiarch location for pyconfig\.h|Must define SIZEOF_WCHAR_T|Require native threads' "$logf"; then
+    # A missing Python.h entirely (no CPython headers in the image) is also an
+    # infra gap, not a fault in our .pyx -- classify it as S4D-UNAVAILABLE too.
+    if grep -qE 'unknown multiarch location for pyconfig\.h|Must define SIZEOF_WCHAR_T|Require native threads|[Pp]ython\.h: No such file' "$logf"; then
         return 3
     fi
     return 1
@@ -127,6 +120,10 @@ for image in "$ARM64_IMAGE" "$X64_IMAGE"; do
     if compile_check "$image"; then
         :
     else
+        # Captured in the else branch on purpose: under `set -e`, a non-zero
+        # return from a function used as an `if` condition does not trip
+        # errexit, so $? here is compile_check's exit (1 = real code error,
+        # 3 = S4D-UNAVAILABLE header gap).
         rc=$?
         if [ "$rc" -eq 3 ]; then
             overall=3
@@ -143,9 +140,9 @@ if [ "$overall" -eq 3 ]; then
     echo "S4D-UNAVAILABLE: dockcross images lack mingw-compatible CPython headers"
     echo "  (Python.h pyconfig.h is Linux-multiarch and rejected by the mingw"
     echo "  cross-target). The Windows SDK headers compile fine; only Python.h"
-    echo "  blocks the Cython compile-check. Set PYTHON_INCLUDE to a directory of"
-    echo "  mingw-w64 CPython headers to enable this gate, or rely on Windows CI"
-    echo "  (S4W) for WIN32 .pyx verification."
+    echo "  blocks the Cython compile-check. Rely on Windows CI (S4W) for WIN32"
+    echo "  .pyx verification; this pre-gate only works if a dockcross image ever"
+    echo "  ships mingw-compatible CPython headers in /usr/include."
     exit 3
 fi
 

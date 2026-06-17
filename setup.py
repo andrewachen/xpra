@@ -1085,6 +1085,10 @@ external_excludes = [
     "nose", "pytest", "_pytest", "pluggy", "more_itertools", "apipkg", "py", "funcsigs",
     "Cython", "cython", "pyximport",
     "pydoc_data",
+    # FIDO2 hardware-key auth: not used by this client build, and the MSYS2
+    # clangarm64 repo has no python-fido2 package, so cx_Freeze cannot bundle it
+    # on arm64. Exclude it so the build does not require the fido2 package.
+    "fido2",
 ]
 if not crypto_ENABLED:
     external_excludes += ["ssl", "_ssl", "uvloop"]
@@ -2204,7 +2208,6 @@ if WIN32:
                 add_console_exe("xpra/platform/keyboard.py",        "keymap.ico",       "Keyboard_info")
                 add_gui_exe("packaging/MSWindows/tools/systemtray_test.py", "xpra.ico",         "SystemTray_Test")
                 add_gui_exe("xpra/gtk/dialogs/u2f_tool.py",     "authentication.ico", "U2F_Tool")
-                add_gui_exe("xpra/gtk/dialogs/fido2_tool.py", "authentication.ico", "Fido2_Tool")
             if client_ENABLED or server_ENABLED:
                 add_console_exe("xpra/platform/win32/scripts/execfile.py", "python.ico", "Python_execfile_cmd")
                 add_gui_exe("xpra/platform/win32/scripts/execfile.py", "python.ico", "Python_execfile_gui")
@@ -2277,7 +2280,6 @@ if WIN32:
     remove_packages(*external_excludes)
     external_includes += [
         "pyu2f",
-        "fido2",
         "mmap",
         "comtypes", "comtypes.stream",      # used by webcam, netdev_query, taskbar progress (file-transfers), etc
         "wmi", "win32com",

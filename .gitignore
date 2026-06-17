@@ -13,6 +13,11 @@
 # win-compile-check.sh extracted MSYS2 mingw CPython headers (cached, not committed):
 /tests/docker/.win-headers-cache/
 
+# Docker build outputs (generated; never committed):
+/build-deb-cache/
+/build-deb-out/
+/build-nvenc-out/
+
 # Python cache:
 __pycache__/
 *.py[cod]

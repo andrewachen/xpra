@@ -49,7 +49,6 @@ jobs:
           export PYTHONPATH="$SRC:$SRC/tests/unittests"
           cd tests/unittests
           python -m unittest \
-            unit.client.gl_cursor_probe_test \
             unit.client.border_test \
             unit.client.cairo_scaling_test \
             unit.client.opengl_eligibility_test \

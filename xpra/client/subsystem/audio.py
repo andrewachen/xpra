@@ -16,13 +16,15 @@ from xpra.net.compression import Compressed
 from xpra.net.packet_type import CONNECTION_LOST
 from xpra.common import noop, SizedBuffer, may_notify_client
 from xpra.constants import NotificationID
-from xpra.os_util import get_machine_id, get_user_uuid, WIN32, OSX, POSIX
+from xpra.os_util import get_machine_id, get_user_uuid, gi_import, WIN32, OSX, POSIX
 from xpra.util.objects import typedict
 from xpra.util.str_fn import csv, bytestostr
 from xpra.util.env import envint
 from xpra.client.base.stub import StubClientMixin
 from xpra.log import Logger
 from xpra.util.thread import start_thread
+
+GLib = gi_import("GLib")
 
 avsynclog = Logger("av-sync")
 log = Logger("client", "audio")

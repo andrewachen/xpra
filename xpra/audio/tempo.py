@@ -10,6 +10,7 @@ import ctypes
 import os
 import sys
 from ctypes import c_void_p, c_float, c_uint, c_int, c_short, POINTER
+from threading import Lock
 
 from xpra.log import Logger
 
@@ -333,6 +334,11 @@ try:
 
         def __init__(self):
             super().__init__()
+            # serializes processor-handle access between the timer thread
+            # (set_tempo) and the GStreamer streaming thread (do_transform_ip
+            # / do_stop): the ctypes calls release the GIL, so without this a
+            # tempo change could destroy/recreate the sonic handle mid-process.
+            self._lock = Lock()
             self._tempo = 1.0
             self._processor = None
             self._rate = 0
@@ -359,21 +365,22 @@ try:
             buffer passes through unmodified (avoids transition pop from
             the discontinuity between unprocessed and processed audio).
             """
-            was_normal = self._tempo == 1.0
-            self._tempo = tempo
-            if not self._processor:
-                return
-            if tempo == 1.0:
-                self._processor.clear()
-            elif was_normal:
-                # transitioning from pass-through to active stretching:
-                self._processor.set_tempo(tempo)
-                self._prime_processor()
-                # skip modifying the next buffer to avoid a pop at the
-                # boundary between unprocessed and processed audio:
-                self._skip_next = True
-            else:
-                self._processor.set_tempo(tempo)
+            with self._lock:
+                was_normal = self._tempo == 1.0
+                self._tempo = tempo
+                if not self._processor:
+                    return
+                if tempo == 1.0:
+                    self._processor.clear()
+                elif was_normal:
+                    # transitioning from pass-through to active stretching:
+                    self._processor.set_tempo(tempo)
+                    self._prime_processor()
+                    # skip modifying the next buffer to avoid a pop at the
+                    # boundary between unprocessed and processed audio:
+                    self._skip_next = True
+                else:
+                    self._processor.set_tempo(tempo)
 
         def _prime_processor(self):
             """Feed cached PCM to give sonic pitch context for immediate output.
@@ -404,57 +411,59 @@ try:
                 self.tempo_status = "create failed: %s" % e
 
         def do_transform_ip(self, buf):
-            # read buffer for priming cache (cheap — just a read-map + copy):
-            ok, map_info = buf.map(Gst.MapFlags.READ)
-            if ok:
-                data = bytes(map_info.data)
-                buf.unmap(map_info)
-                self._last_pcm = (self._last_pcm + [data])[-2:]
-            else:
-                data = None
+            with self._lock:
+                # read buffer for priming cache (cheap — just a read-map + copy):
+                ok, map_info = buf.map(Gst.MapFlags.READ)
+                if ok:
+                    data = bytes(map_info.data)
+                    buf.unmap(map_info)
+                    self._last_pcm = (self._last_pcm + [data])[-2:]
+                else:
+                    data = None
 
-            if self._tempo == 1.0 or not data:
-                return Gst.FlowReturn.OK
-
-            # skip the first buffer after a 1.0→non-1.0 transition to
-            # avoid a pop at the unprocessed/processed audio boundary.
-            # feed the data to sonic (builds context) but don't write back:
-            if self._skip_next:
-                self._skip_next = False
-                if self._processor:
-                    self._processor.process_fixed_size(data)
-                return Gst.FlowReturn.OK
-
-            if not self._processor:
-                self._ensure_processor()
-                if not self._processor:
+                if self._tempo == 1.0 or not data:
                     return Gst.FlowReturn.OK
 
-            try:
-                if TEMPO_BACKEND == "passthrough":
-                    # diagnostic: read + write back original data (no processing).
-                    # if this pops, the issue is the pipeline, not the library:
-                    output = data
-                else:
-                    output = self._processor.process_fixed_size(data)
-                ok, map_info = buf.map(Gst.MapFlags.WRITE)
-                if ok:
-                    map_info.data[:len(output)] = output
-                    buf.unmap(map_info)
-                    self.tempo_count += 1
-                else:
+                # skip the first buffer after a 1.0→non-1.0 transition to
+                # avoid a pop at the unprocessed/processed audio boundary.
+                # feed the data to sonic (builds context) but don't write back:
+                if self._skip_next:
+                    self._skip_next = False
+                    if self._processor:
+                        self._processor.process_fixed_size(data)
+                    return Gst.FlowReturn.OK
+
+                if not self._processor:
+                    self._ensure_processor()
+                    if not self._processor:
+                        return Gst.FlowReturn.OK
+
+                try:
+                    if TEMPO_BACKEND == "passthrough":
+                        # diagnostic: read + write back original data (no processing).
+                        # if this pops, the issue is the pipeline, not the library:
+                        output = data
+                    else:
+                        output = self._processor.process_fixed_size(data)
+                    ok, map_info = buf.map(Gst.MapFlags.WRITE)
+                    if ok:
+                        map_info.data[:len(output)] = output
+                        buf.unmap(map_info)
+                        self.tempo_count += 1
+                    else:
+                        self.probe_errors += 1
+                        self.tempo_status = "write map failed"
+                except Exception as e:
                     self.probe_errors += 1
-                    self.tempo_status = "write map failed"
-            except Exception as e:
-                self.probe_errors += 1
-                if self.probe_errors <= 3:
-                    self.tempo_status = "error: %s" % e
-            return Gst.FlowReturn.OK
+                    if self.probe_errors <= 3:
+                        self.tempo_status = "error: %s" % e
+                return Gst.FlowReturn.OK
 
         def do_stop(self):
-            if self._processor:
-                self._processor.destroy()
-                self._processor = None
+            with self._lock:
+                if self._processor:
+                    self._processor.destroy()
+                    self._processor = None
             return True
 
     GObject.type_register(TempoTransform)

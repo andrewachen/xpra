@@ -68,8 +68,12 @@ GIT_SHA=$(git -C "$REPO_DIR" rev-parse --short HEAD)
 GIT_BRANCH=$(git -C "$REPO_DIR" branch --show-current)
 GIT_LOCAL_MODS=$(git -C "$REPO_DIR" diff --shortstat 2>/dev/null | wc -l)
 DIST=$(lsb_release -cs)
-# Sorts above xpra-org's "6.4.5-r0-1" naming so apt prefers our build.
-VERSION="6.4.5-achen-${GIT_SHA}~${DIST}"
+# Derive the base version from the source tree (xpra/__init__.py __version__)
+# so the package version tracks the branch's actual release base (6.5, 6.5.x,
+# ...) instead of a hardcoded value.
+BASE_VERSION=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$REPO_DIR/xpra/__init__.py")
+# Sorts above xpra-org's "<base>-r0-1" naming so apt prefers our build.
+VERSION="${BASE_VERSION}-achen-${GIT_SHA}~${DIST}"
 
 mkdir -p "$CACHE_DIR" "$OUT_DIR"
 rm -f "$OUT_DIR"/*.deb "$OUT_DIR"/*.buildinfo "$OUT_DIR"/*.changes 2>/dev/null || true
@@ -151,7 +155,7 @@ EOF
         # Prepend a changelog entry so the resulting .deb gets our version
         # string. Writing the entry directly (vs dch) avoids needing tty/env.
         TS=$(date -R)
-        NEW_ENTRY="xpra (${VERSION}) UNRELEASED; urgency=low\n\n  * Build from v6.4.3-achen ${GIT_SHA}\n\n -- ${DEBFULLNAME} <${DEBEMAIL}>  ${TS}\n\n"
+        NEW_ENTRY="xpra (${VERSION}) UNRELEASED; urgency=low\n\n  * Build from ${GIT_BRANCH} ${GIT_SHA}\n\n -- ${DEBFULLNAME} <${DEBEMAIL}>  ${TS}\n\n"
         printf "$NEW_ENTRY" > /tmp/changelog.new
         cat debian/changelog >> /tmp/changelog.new
         mv /tmp/changelog.new debian/changelog

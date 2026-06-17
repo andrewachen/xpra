@@ -553,8 +553,12 @@ class AudioClient(StubClientMixin):
             return False
         # video decode component (for AV sync on LAN).
         # jitter measurement is handled entirely by the audio subprocess —
-        # it combines this target with its own jitter histogram internally:
-        mean_ms, stddev_ms = self.get_video_decode_stats()
+        # it combines this target with its own jitter histogram internally.
+        # get_video_decode_stats() lives on the window subsystem; an audio-only
+        # client (--windows=no) has no WindowDraw mixin, so fall back to no
+        # video component there.
+        get_stats = getattr(self, "get_video_decode_stats", None)
+        mean_ms, stddev_ms = get_stats() if get_stats else (0.0, 0.0)
         if mean_ms > 0:
             av_component = max(mean_ms - AUDIO_PIPELINE_LATENCY_MS, stddev_ms + 10, 0)
         else:

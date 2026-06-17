@@ -10,6 +10,9 @@
 # temporary files:
 *.swp
 
+# win-compile-check.sh extracted MSYS2 mingw CPython headers (cached, not committed):
+/tests/docker/.win-headers-cache/
+
 # Python cache:
 __pycache__/
 *.py[cod]

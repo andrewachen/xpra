@@ -202,7 +202,33 @@ class ClientWebTransportConnection(XpraQuicConnection):
         super().http_event_received(event)
 
 
-class WebTransportClient(QuicConnectionProtocol):
+class XpraQuicClientProtocol(QuicConnectionProtocol):
+    """Common base for xpra's QUIC client protocols.
+
+    Captures TLS/handshake errors raised from datagram_received so that
+    _quic_connect can surface a meaningful exit code instead of hanging
+    until the connection timeout. Shared by both the WebSocket and
+    WebTransport transports.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tls_error: Exception | None = None
+
+    def datagram_received(self, data, addr) -> None:
+        try:
+            super().datagram_received(data, addr)
+        except Exception as e:
+            log("datagram_received TLS error", exc_info=True)
+            self._tls_error = e
+            # resolve the connected waiter so we don't hang until timeout
+            if self._connected_waiter is not None:
+                waiter = self._connected_waiter
+                self._connected_waiter = None
+                waiter.set_exception(e)
+
+
+class WebTransportClient(XpraQuicClientProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # WebTransport requires H3 with enable_webtransport=True
@@ -237,30 +263,17 @@ class WebTransportClient(QuicConnectionProtocol):
             log("WebTransportClient: no session for %s", event)
 
 
-class WebSocketClient(QuicConnectionProtocol):
+class WebSocketClient(XpraQuicClientProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._http: HttpConnection | None = None
         self._websockets: dict[int, ClientWebSocketConnection] = {}
         self._substream_map: dict[int, ClientWebSocketConnection] = {}
         self._substream_buffers: dict[int, bytes] = {}
-        self._tls_error: Exception | None = None
         if self._quic.configuration.alpn_protocols[0].startswith("hq-"):
             self._http = H0Connection(self._quic)
         else:
             self._http = H3Connection(self._quic)
-
-    def datagram_received(self, data, addr) -> None:
-        try:
-            super().datagram_received(data, addr)
-        except Exception as e:
-            log("datagram_received TLS error", exc_info=True)
-            self._tls_error = e
-            # resolve the connected waiter so we don't hang until timeout
-            if self._connected_waiter is not None:
-                waiter = self._connected_waiter
-                self._connected_waiter = None
-                waiter.set_exception(e)
 
     def register_substream(self, stream_id: int, handler: ClientWebSocketConnection) -> None:
         """Register a client-initiated substream so it bypasses H3 processing."""

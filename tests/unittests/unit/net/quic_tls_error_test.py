@@ -94,8 +94,9 @@ class TestDatagramReceivedErrorCapture(unittest.TestCase):
         except ImportError:
             raise unittest.SkipTest("pyOpenSSL not available")
         tls_err = OpenSSLError([("x509 certificate routines", "", "certificate verify failed")])
-        # patch the parent datagram_received to simulate a TLS error
-        with patch.object(type(protocol).__mro__[1], "datagram_received", side_effect=tls_err):
+        # patch the aioquic base datagram_received (called via super()) to simulate a TLS error
+        from aioquic.asyncio.protocol import QuicConnectionProtocol
+        with patch.object(QuicConnectionProtocol, "datagram_received", side_effect=tls_err):
             protocol.datagram_received(b"\x00" * 10, ("127.0.0.1", 10000))
         self.assertIs(protocol._tls_error, tls_err)
 
@@ -111,7 +112,8 @@ class TestDatagramReceivedErrorCapture(unittest.TestCase):
         loop = asyncio.new_event_loop()
         waiter = loop.create_future()
         protocol._connected_waiter = waiter
-        with patch.object(type(protocol).__mro__[1], "datagram_received", side_effect=tls_err):
+        from aioquic.asyncio.protocol import QuicConnectionProtocol
+        with patch.object(QuicConnectionProtocol, "datagram_received", side_effect=tls_err):
             protocol.datagram_received(b"\x00" * 10, ("127.0.0.1", 10000))
         # waiter should have the exception set
         self.assertTrue(waiter.done())
@@ -122,7 +124,8 @@ class TestDatagramReceivedErrorCapture(unittest.TestCase):
     def test_no_error_on_normal_datagram(self):
         """Normal datagrams don't set _tls_error."""
         protocol = self._make_protocol()
-        with patch.object(type(protocol).__mro__[1], "datagram_received"):
+        from aioquic.asyncio.protocol import QuicConnectionProtocol
+        with patch.object(QuicConnectionProtocol, "datagram_received"):
             protocol.datagram_received(b"\x00" * 10, ("127.0.0.1", 10000))
         self.assertIsNone(protocol._tls_error)
 

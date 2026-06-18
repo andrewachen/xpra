@@ -13,7 +13,14 @@ from unittest.mock import patch
 
 from xpra.exit_codes import ExitCode
 
+try:
+    import aioquic
+    HAVE_AIOQUIC = bool(aioquic)
+except ImportError:
+    HAVE_AIOQUIC = False
 
+
+@unittest.skipUnless(HAVE_AIOQUIC, "aioquic not available")
 class TestFormatTLSError(unittest.TestCase):
     """Test that TLS/OpenSSL exceptions are mapped to user-friendly messages."""
 
@@ -74,6 +81,7 @@ class TestFormatTLSError(unittest.TestCase):
         self.assertIn("something went wrong", msg)
 
 
+@unittest.skipUnless(HAVE_AIOQUIC, "aioquic not available")
 class TestDatagramReceivedErrorCapture(unittest.TestCase):
     """Test that WebSocketClient.datagram_received catches TLS errors."""
 

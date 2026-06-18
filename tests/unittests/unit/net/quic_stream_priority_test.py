@@ -10,6 +10,12 @@
 import unittest
 from unittest.mock import MagicMock, PropertyMock
 
+try:
+    import aioquic
+    HAVE_AIOQUIC = bool(aioquic)
+except ImportError:
+    HAVE_AIOQUIC = False
+
 
 class FakeQuicStream:
     """Minimal stand-in for aioquic QuicStream."""
@@ -17,6 +23,7 @@ class FakeQuicStream:
         self.stream_id = stream_id
 
 
+@unittest.skipUnless(HAVE_AIOQUIC, "aioquic not available")
 class TestPrioritizeStreams(unittest.TestCase):
     """Test that _prioritize_streams reorders the aioquic stream dict correctly."""
 
@@ -126,6 +133,7 @@ class TestPrioritizeStreams(unittest.TestCase):
         conn._prioritize_streams()
 
 
+@unittest.skipUnless(HAVE_AIOQUIC, "aioquic not available")
 class TestAllocateSubstreamCallsPrioritize(unittest.TestCase):
     """Verify that _allocate_substream triggers _prioritize_streams."""
 

@@ -325,6 +325,10 @@ class XpraQuicConnection(Connection):
 
     def put_raw_substream_data(self, data: bytes, stream_id: int = 1) -> None:
         """Deliver substream data directly to the xpra packet parser, bypassing WebSocket framing."""
+        if not data:
+            # a FIN-only frame carries no payload; delivering an empty buffer would
+            # trip the packet parser's close sentinel and tear down the connection
+            return
         log(f"put_raw_substream_data: {len(data)} bytes on stream {stream_id}")
         if self._raw_read_cb:
             self._raw_read_cb(data, stream_id)

@@ -353,6 +353,23 @@ def get_jhbuild_package_info(name: str) -> dict[str, str]:
     return props
 
 
+def parse_describe(describe_output: str):
+    """Parse 'git describe --long --always --tags' into (revision, commit).
+
+    The format is '<tag>-<count>-g<sha>'. The tag name itself may contain
+    hyphens (e.g. 'v6.5-achen-substream-guard'), so the count and commit are
+    taken from the right-hand side. A bare abbreviated SHA (no reachable tag,
+    from --always) has no hyphens. Returns None if the string cannot be parsed.
+    """
+    parts = describe_output.rsplit("-", 2)
+    if len(parts) == 1:
+        # just an abbreviated commit hash: no tag, so no revision count
+        return "0", parts[0]
+    if len(parts) == 3:
+        return parts[1], parts[2]
+    return None
+
+
 def get_vcs_props():
     props = {
         "REVISION": "unknown",
@@ -393,17 +410,11 @@ def get_vcs_props():
         return props
     out = out.decode('utf-8').splitlines()[0]
     # ie: out=v4.0.6-58-g6e6614571
-    parts = out.split("-")
-    if len(parts) == 1:
-        commit = parts[0]
-        print("could not get revision number - no tags?")
-        rev_str = "0"
-    elif len(parts) == 3:
-        rev_str = parts[1]
-        commit = parts[2]
-    else:
+    parsed = parse_describe(out)
+    if parsed is None:
         print("could not parse version information from string: %s" % out)
         return props
+    rev_str, commit = parsed
     props["COMMIT"] = commit
     try:
         rev = int(rev_str)

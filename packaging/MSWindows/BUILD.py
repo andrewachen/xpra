@@ -430,6 +430,14 @@ def load_version_info(light: bool) -> None:
     src_info = load_module(SRC_INFO)
 
     revision = src_info.REVISION
+    # the Windows manifest / verpatch version must be fully numeric (n.n.n.n);
+    # never let a non-numeric revision (e.g. "unknown" from failed VCS detection)
+    # reach the version string, or Windows rejects the installer's manifest:
+    try:
+        revision = int(revision)
+    except (TypeError, ValueError):
+        print(f"Warning: non-numeric revision {revision!r}, using 0 for the version")
+        revision = 0
 
     full_string = f"{xpra.__version__}-r{revision}"
     if src_info.LOCAL_MODIFICATIONS:

@@ -63,7 +63,21 @@ for x in cryptography cffi pycparser numpy pillow appdirs paramiko comtypes neti
     $PACMAN ${XPKG}python-${x} || echo "Warning: python-${x} not available, skipping"
 done
 
+# pip is needed by the cx_Freeze fallback and the pip-only packages below.
+$PACMAN ${XPKG}python-pip || true
+
+# cx_Freeze dependencies that pip cannot reliably build on MSYS2:
+# lief (PyPI sdist refuses mingw), msilib, and cx-logging (header needed
+# to build freeze-core's Win32Service base) come from pacman; cabarchive,
+# filelock and striprtf are freeze-core runtime deps packaged in pacman.
+# gendef (in the mingw tools package) is needed by freeze-core's build.
+$PACMAN ${XPKG}tools || true
+$PACMAN ${XPKG}python-lief ${XPKG}python-msilib ${XPKG}python-cx-logging || true
+$PACMAN ${XPKG}python-cabarchive ${XPKG}python-filelock ${XPKG}python-striprtf || true
+
 # cx_Freeze: bundles Python + all extensions into a standalone dist/ tree.
+# Not packaged in every MSYS2 environment, so fall back to pip — which must
+# therefore be installed first.
 if ! $PACMAN ${XPKG}python-cx-freeze 2>/dev/null; then
     echo "cx_Freeze not in pacman — installing via pip..."
     pip3 install "cx_Freeze>=7.0"

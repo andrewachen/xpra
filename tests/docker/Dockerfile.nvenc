@@ -29,7 +29,9 @@ RUN apt-get update && apt-get -y install --no-install-recommends \
     pandoc \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install cython --break-system-packages
+# pinned: Cython 3.1+ refuses the NV_ENC_CAPS enum assignment in
+# xpra/codecs/nvidia/nvenc/encoder.pyx (int-to-enum typing became an error)
+RUN pip3 install "cython<3.1" --break-system-packages
 
 # Download nvEncodeAPI.h (SDK 13) from FFmpeg/nv-codec-headers.
 RUN mkdir -p /opt/nvenc/Interface && \

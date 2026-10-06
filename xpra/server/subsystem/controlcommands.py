@@ -73,6 +73,7 @@ class ServerBaseControlCommands(StubServerMixin):
                 # server globals:
                 ArgsControlCommand("readonly", "set readonly state for client(s)", min_args=1, max_args=1,
                                    validation=[parse_boolean_value]),
+                ArgsControlCommand("reload-ssl", "reload the SSL certificate and key from disk", max_args=0),
                 ArgsControlCommand("idle-timeout", "set the idle timeout", validation=[int]),
                 ArgsControlCommand("server-idle-timeout", "set the server idle timeout", validation=[int]),
                 ArgsControlCommand("start-env", "modify the environment used to start new commands", min_args=1),

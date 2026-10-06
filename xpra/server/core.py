@@ -178,6 +178,12 @@ class ServerCore(ServerBaseClass):
         self.socket_cleanup: list[Callable] = []
         self.socket_verify_timer: WeakKeyDictionary[SocketProtocol, int] = WeakKeyDictionary()
         self.socket_rfb_upgrade_timer: WeakKeyDictionary[SocketProtocol, int] = WeakKeyDictionary()
+        # live QUIC listener certificates, for the reload-ssl control command:
+        # (cert_path, key_path, QuicConfiguration, SessionTicketStore, loop)
+        # QuicConfiguration/SessionTicketStore are only available when aioquic
+        # is installed, hence Any; the registry never imports aioquic.
+        self.quic_certificates: list[tuple[str, str, Any, Any, Any]] = []
+        self.quic_certificates_lock = threading.Lock()
         self._max_connections: int = MAX_CONCURRENT_CONNECTIONS
         self._socket_timeout: float = SERVER_SOCKET_TIMEOUT
         self._ws_timeout: int = 5
@@ -247,6 +253,96 @@ class ServerCore(ServerBaseClass):
 
     def init_control_commands(self) -> None:
         self.add_default_control_commands(features.control)
+
+    def add_quic_configuration(self, cert: str, key: str,
+                               configuration, ticket_store, loop) -> None:
+        netlog("add_quic_configuration(%s, %s, %s)", cert, key, configuration)
+        with self.quic_certificates_lock:
+            self.quic_certificates.append(
+                (cert, key, configuration, ticket_store, loop))
+
+    def remove_quic_configuration(self, configuration) -> None:
+        netlog("remove_quic_configuration(%s)", configuration)
+        with self.quic_certificates_lock:
+            self.quic_certificates = [
+                entry for entry in self.quic_certificates
+                if entry[2] is not configuration
+            ]
+
+    def control_command_reload_ssl(self) -> str:
+        netlog("control_command_reload_ssl()")
+        with self.quic_certificates_lock:
+            snapshot = list(self.quic_certificates)
+        if not snapshot:
+            return ("no QUIC listeners with a cached SSL certificate"
+                    " (TCP sockets re-read the certificate for each connection)")
+        from xpra.net.control.common import ControlError
+        from xpra.net.quic.listener import (
+            apply_quic_certificate,
+            validate_certificate_files,
+        )
+        tcp_note = " (TCP sockets re-read the certificate for each connection)"
+        results = []
+        errors = []
+        processed: list[Any] = []
+        # configuration objects already applied, kept alive and compared by
+        # identity: id()-keying is unsafe because an object freed between
+        # passes can have its id() reused by an unrelated new object
+        # A listener can finish starting up while this command runs; re-check
+        # for late registrations so no listener keeps serving a pre-reload
+        # certificate. Bounded: registrations during a reload are rare.
+        for _pass in range(3):
+            if errors:
+                # a previous pass failed (validation or apply); do not run
+                # another full validation pass — errors are raised after the
+                # loop, together with any entries that did reload
+                break
+            with self.quic_certificates_lock:
+                snapshot = list(self.quic_certificates)
+            pending = [entry for entry in snapshot
+                       if all(entry[2] is not proc for proc in processed)]
+            if not pending:
+                break
+            # validate every pending entry before applying to any of them:
+            validated = []
+            for cert, key, configuration, ticket_store, loop in pending:
+                try:
+                    validated.append(
+                        (validate_certificate_files(cert, key),
+                         configuration, ticket_store, loop, cert))
+                except ValueError as e:
+                    errors.append(str(e))
+            if errors:
+                # a pending entry failed validation; nothing was applied in
+                # this pass, but an earlier pass may have reloaded entries —
+                # report both via the combined message after the loop
+                break
+            for (certificate, chain, private_key), configuration, ticket_store, loop, cert in validated:
+                try:
+                    results.append(apply_quic_certificate(
+                        configuration, certificate, chain, private_key,
+                        ticket_store, loop, cert))
+                except ValueError as e:
+                    errors.append(str(e))
+                else:
+                    processed.append(configuration)
+        if errors:
+            # apply-phase failures (dead or wedged listener loop); say which
+            # entries did reload so the operator is not left guessing:
+            raise ControlError(
+                ("reloaded: %s; " % "; ".join(results) if results else "")
+                + "failed: " + "; ".join(errors))
+        with self.quic_certificates_lock:
+            leftover = [entry for entry in self.quic_certificates
+                        if all(entry[2] is not proc for proc in processed)]
+        if leftover:
+            # a listener registered during the reload after the last pass
+            # snapshot: never claim success while an entry still serves the
+            # pre-reload certificate
+            raise ControlError(
+                "%d listener(s) registered during the reload were not reloaded;"
+                " run reload-ssl again" % len(leftover))
+        return "; ".join(results) + tcp_note
 
     ######################################################################
     # run / stop:

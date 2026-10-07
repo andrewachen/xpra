@@ -32,6 +32,7 @@ class TestReloadSSLCommand(unittest.TestCase):
         server = ServerCore.__new__(ServerCore)
         server.quic_certificates = list(entries)
         server.quic_certificates_lock = threading.Lock()
+        server.quic_reload_lock = threading.Lock()
         return server
 
     def _make_config(self, cert_path, key_path):
@@ -161,23 +162,17 @@ class TestReloadSSLCommand(unittest.TestCase):
         assert late_configuration.certificate.serial_number != old_serial
 
     def test_reload_ssl_command_registered(self):
-        # on this branch the control commands are registered by
-        # ServerBaseControlCommands via getattr(self, "control_command_..."):
-        from xpra.server.subsystem.controlcommands import ServerBaseControlCommands
-
-        class StubServer(ServerBaseControlCommands):
-            def __init__(self):
-                self.commands = {}
-
-            def add_control_command(self, name, control):
-                self.commands[name] = control
-
-            def control_command_reload_ssl(self) -> str:
-                return ""
-
-        stub = StubServer()
-        stub.add_control_commands()
-        command = stub.commands["reload-ssl"]
+        # on this branch the command is registered at core level, in
+        # ServerCore.init_control_commands, so ServerCore-only servers
+        # (ie the proxy) get it too:
+        from xpra.server.core import ServerCore
+        server = ServerCore.__new__(ServerCore)
+        server.commands = {}
+        server.add_control_command = (
+            lambda name, control: server.commands.__setitem__(name, control))
+        server.add_default_control_commands = lambda enabled=True: None
+        server.init_control_commands()
+        command = server.commands["reload-ssl"]
         assert command.max_args == 0
         assert "reload" in command.help.lower()
 

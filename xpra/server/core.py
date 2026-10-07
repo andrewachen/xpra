@@ -184,6 +184,9 @@ class ServerCore(ServerBaseClass):
         # is installed, hence Any; the registry never imports aioquic.
         self.quic_certificates: list[tuple[str, str, Any, Any, Any]] = []
         self.quic_certificates_lock = threading.Lock()
+        # serializes whole reload-ssl commands against each other, so two
+        # concurrent reloads cannot apply in reversed order:
+        self.quic_reload_lock = threading.Lock()
         self._max_connections: int = MAX_CONCURRENT_CONNECTIONS
         self._socket_timeout: float = SERVER_SOCKET_TIMEOUT
         self._ws_timeout: int = 5
@@ -253,6 +256,14 @@ class ServerCore(ServerBaseClass):
 
     def init_control_commands(self) -> None:
         self.add_default_control_commands(features.control)
+        # core-level command: ServerBase subclasses re-register it via
+        # ServerBaseControlCommands, but ServerCore-only servers (ie the
+        # proxy) would otherwise miss reload-ssl
+        if features.control:
+            from xpra.net.control.common import ArgsControlCommand
+            self.add_control_command("reload-ssl", ArgsControlCommand(
+                "reload-ssl", "reload the SSL certificate and key from disk",
+                run=self.control_command_reload_ssl, max_args=0))
 
     def add_quic_configuration(self, cert: str, key: str,
                                configuration, ticket_store, loop) -> None:
@@ -271,6 +282,12 @@ class ServerCore(ServerBaseClass):
 
     def control_command_reload_ssl(self) -> str:
         netlog("control_command_reload_ssl()")
+        # hold for the whole validate+apply so concurrent commands cannot
+        # interleave and apply an older validated set over a newer one:
+        with self.quic_reload_lock:
+            return self.do_control_command_reload_ssl()
+
+    def do_control_command_reload_ssl(self) -> str:
         with self.quic_certificates_lock:
             snapshot = list(self.quic_certificates)
         if not snapshot:

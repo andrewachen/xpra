@@ -31,7 +31,11 @@ echo "Compiler flags: CFLAGS=${CFLAGS}"
 # shell mid-update. Reaching this script means the upgrade is already done.
 
 # Core: Python runtime, GTK3 UI toolkit, desktop notifications
-$PACMAN ${XPKG}python ${XPKG}libnotify ${XPKG}gtk3
+# libnotify was dropped from the deprecated mingw64 environment (2026-10):
+# the win32 client uses its native tray-balloon notifier anyway, so treat it
+# as optional. clangarm64/ucrt64/clang64 still ship it.
+$PACMAN ${XPKG}python ${XPKG}gtk3
+$PACMAN ${XPKG}libnotify || echo "Warning: libnotify not available, skipping"
 
 # Media libraries (libspng present in 6.4 branch; harmless on master)
 $PACMAN ${XPKG}libspng ${XPKG}libavif ${XPKG}gst-plugins-good ${XPKG}gst-plugins-bad ${XPKG}gst-plugins-ugly
